@@ -632,8 +632,8 @@ md5sum /tmp/vkroot/lib/firmware/ath12k/*/hw*/{board-2.bin,fw_version.txt}
 | build7/8 | BDF `Build/Prepare`、国家码、802.11k、gettext 回退、sockaddr 补丁、BTF 关闭 | 能出镜像；刷机后 Q6 `error -5` |
 | build10/13 | DTS tzapp/WCSS 对齐、CMA 128、ath12k 补丁集换成 VIKING 版、内核 PAS v2 补丁 | **Q6 启动成功**（`res=0`），但 cal 数据缺失 → `-110` |
 | build14 | IPQ5332 固件降级到 1.6-01270；新增 `S09ath12k-caldata` | MLO 断言消失、无重启循环；**5G 正常、2.4G `AP-DISABLED`（MAX-AMSDU）** |
-| build16 | 补丁 331（MAX-AMSDU 无条件置位） | 待刷机验证 2.4G |
-| build17 | build16 + `wpad-mbedtls`（LuCI 显示 802.11k/v） | 待刷机验证 |
+| build16 | 补丁 331（MAX-AMSDU 无条件置位） | 未刷机，被 build17 取代 |
+| build17 | build16 + `wpad-mbedtls`（LuCI 显示 802.11k/v） | **刷机验证通过（见 12.1）** |
 
 产物校验（供对照）：
 
@@ -641,6 +641,38 @@ md5sum /tmp/vkroot/lib/firmware/ath12k/*/hw*/{board-2.bin,fw_version.txt}
 |---|---|
 | build14 | `dfd02ca742893496dd8fd4d1ac34adfec4e13421c61cb28d6b36149fa4ef4bef` |
 | build16 | `bf6ee4da3dae36133e4784c3901b8f8ed3ab003c7f2cb665ebaa0eaef4d19c94` |
+| build17 | `753a4853a0fed9d091b9265431006f71caef4ec24fc13ca109f40b6148d201f1` |
+
+### 12.1 build17 刷机验证结果（2026-11-17）
+
+`openwrt-qualcommbe-ipq53xx-jdcloud_re-cs-06-squashfs-sysupgrade.bin`
+sha256 `753a4853a0fed9d091b9265431006f71caef4ec24fc13ca109f40b6148d201f1`
+
+| 检查项 | 修复前（build14） | 修复后（build17） |
+|---|---|---|
+| Band 1 (2.4G) Capabilities | `0x11e7`（无 0x800） | **`0x19e7`**（含 0x800） |
+| Band 2 (5G) Capabilities | `0x19e7` | `0x19e7` |
+| `does not support configured HT` 次数 | 反复出现 | **0** |
+| 2.4G 接口 | `HT Mode: NOHT`、`Tx-Power: 0 dBm`、`AP-DISABLED` | **`Channel 6`、`HE20`、`26 dBm`、ENABLED** |
+| 5G 接口 | `EHT160` | `Channel 36`、`EHT160`、`30 dBm`、DFS-CAC 完成后 ENABLED |
+| wpad | `wpad-basic-mbedtls` | **`wpad-mbedtls 2024-09-15-5ace39b0-1`** |
+| q6 崩溃 | 每 2-3 分钟 1 次 | **0** |
+
+2.4G 实际生成的 hostapd 配置（能力位已被接受）：
+
+```
+hw_mode=g
+channel=6
+ht_capab=[LDPC][SHORT-GI-20][SHORT-GI-40][TX-STBC][RX-STBC1][MAX-AMSDU-7935][DSSS_CCK-40]
+rrm_neighbor_report=1
+rrm_beacon_report=1
+```
+
+`MAX-AMSDU-7935` 仍在列表里且 BSS 正常 ENABLED —— 证明补丁 331 修的是**驱动声明**
+这个位，而不是绕过 hostapd 校验。
+
+结论：无线三个故障（MLO 崩溃、cal 数据缺失、2.4G MAX-AMSDU）**全部解决**，
+Wi-Fi 7 双频（2.4G HE20 + 5G EHT160）同时在线。
 
 ---
 
@@ -666,8 +698,8 @@ iwinfo | grep -A1 wlan0-0       # 期望 Channel 6 + HT Mode: HE20
 
 | 项 | 状态 | 备注 |
 |---|---|---|
-| 三频（5.2+5.8 / 6 GHz） | 未展开 | `qcom,num-radios=<1>` 只暴露 2 band；国内 6 GHz 未开放 |
+| 三频（5.2+5.8 / 6 GHz） | 未展开（可选） | `qcom,num-radios=<1>` 只暴露 2 band；国内 6 GHz 未开放 |
 | ACS + 双 vif | 已知问题 | 两个 vif 同时 ACS 会 `-16 EBUSY`，建议配固定信道 |
-| 2.4G A-MSDU 真实性 | 待实测 | 若打流异常，回退补丁 331 即可 |
+| 2.4G A-MSDU 真实性 | 待客户端实测打流 | 若打流异常，回退补丁 331 即可 |
 | `products-sha256sums.txt` | 需更新 | 每次出包更新 |
 | 内网 gitea（10.0.0.166:1005） | 不可达 | 恢复后补推 |
