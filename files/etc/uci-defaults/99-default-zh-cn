@@ -1,23 +1,54 @@
 #!/bin/sh
-# 默认中文界面 + 中国时区（首次启动生效，仅执行一次）
-# LuCI dispatcher 会把 'zh_cn' 转成 'zh-cn' 查找 .lmo 翻译目录
+# 出厂默认值：中文界面 + Vantage 主题 + 中国时区 + 主机名 JDCloud
+#
+# ⚠️ uci-defaults 在每次 sysupgrade 后都会重新跑一遍（新镜像里脚本又存在），
+# 所以这里**每个值都加"未被用户改过"的判定**，只补默认值，绝不覆盖用户已有设置。
+# 否则升级一次就把用户自己改的 SSID / 主机名 / 语言全冲掉了。
+
+# ---- LuCI：语言 / 主题 ------------------------------------------------
 uci -q get luci.main >/dev/null || uci set luci.main=core
-uci set luci.main.lang='zh_cn'
-# 默认主题：Vantage（主题包自带 30_luci-theme-vantage 注册，本脚本编号更大，后执行覆盖）
-uci set luci.themes.Vantage='/luci-static/vantage'
-uci set luci.main.mediaurlbase='/luci-static/vantage'
+
+# 语言：只有未设置或仍是 'auto' 时才设成中文
+lang=$(uci -q get luci.main.lang)
+case "$lang" in
+	''|auto) uci set luci.main.lang='zh_cn' ;;
+esac
+
+# 主题：只有仍是默认 bootstrap（或未设置）时才换成 Vantage
+media=$(uci -q get luci.main.mediaurlbase)
+case "$media" in
+	''|/luci-static/bootstrap)
+		# 主题包自带 30_luci-theme-vantage 注册，本脚本编号更大，后执行覆盖
+		uci set luci.themes.Vantage='/luci-static/vantage'
+		uci set luci.main.mediaurlbase='/luci-static/vantage'
+		;;
+esac
 uci commit luci
 
-# 时区 / NTP / 主机名
-uci -q get system.ntp >/dev/null || uci set system.ntp=timeserver
-uci set system.@system[0].hostname='JDCloud'
-uci set system.@system[0].timezone='CST-8'
-uci set system.@system[0].zonename='Asia/Shanghai'
-uci -q delete system.ntp.server 2>/dev/null
-uci add_list system.ntp.server='ntp.ntsc.ac.cn'
-uci add_list system.ntp.server='cn.pool.ntp.org'
-uci add_list system.ntp.server='ntp.aliyun.com'
-uci add_list system.ntp.server='time1.cloud.tencent.com'
+# ---- 系统：主机名 / 时区 / NTP ---------------------------------------
+# 主机名：只有还是出厂默认 'OpenWrt' 时才改成 JDCloud
+hostname=$(uci -q get system.@system[0].hostname)
+case "$hostname" in
+	''|OpenWrt) uci set system.@system[0].hostname='JDCloud' ;;
+esac
+
+# 时区：只有未设置或仍是 'UTC' 时才写中国标准时间
+tz=$(uci -q get system.@system[0].timezone)
+case "$tz" in
+	''|UTC)
+		uci set system.@system[0].timezone='CST-8'
+		uci set system.@system[0].zonename='Asia/Shanghai'
+		;;
+esac
+
+# NTP：只有还没配置过服务器时才写（避免升级后不断堆重复条目）
+if ! uci -q get system.ntp >/dev/null; then
+	uci set system.ntp=timeserver
+	uci add_list system.ntp.server='ntp.ntsc.ac.cn'
+	uci add_list system.ntp.server='cn.pool.ntp.org'
+	uci add_list system.ntp.server='ntp.aliyun.com'
+	uci add_list system.ntp.server='time1.cloud.tencent.com'
+fi
 uci commit system
 
 exit 0

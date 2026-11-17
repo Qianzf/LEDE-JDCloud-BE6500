@@ -351,7 +351,11 @@ mac80211_emit_detect() {
 	key="$default_key"
 	num_global_macaddr="$default_mac_count"
 
-	[ -n "$ssid" ] || ssid="LEDE"
+	# 默认 SSID（仅在生成 /etc/config/wireless 时使用）
+	case "$band" in
+		5g|6g) [ -n "$ssid" ] || ssid="JDCwifi-5G" ;;
+		*)     [ -n "$ssid" ] || ssid="JDCwifi" ;;
+	esac
 	[ -n "$country" ] || country="CN"
 
 	case "$band" in
