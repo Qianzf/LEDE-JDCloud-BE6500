@@ -1,0 +1,38 @@
+From: Pi <pi@local>
+Date: Tue, 17 Nov 2026 15:05:00 +0800
+Subject: [PATCH] wifi: ath12k: advertise MAX_AMSDU on every band
+
+ath12k derives IEEE80211_HT_CAP_MAX_AMSDU from the firmware VHT capability
+word.  Radios that are limited to 2.4 GHz report no VHT capabilities at
+all, so the bit was missing on band 1 while band 2 (5 GHz) advertised it.
+
+On the IPQ53xx MLO group both radios share one wiphy, so the OpenWrt
+wireless configuration helper ORs the HT capabilities of all bands
+together and applies the result to each radio.  The 2.4 GHz radio then
+asks hostapd for MAX-AMSDU-7935, which hostapd validates against that
+band's own capabilities, fails, and disables the BSS:
+
+  Driver does not support configured HT capability [MAX-AMSDU-7935]
+  wlan0: interface state COUNTRY_UPDATE->DISABLED
+
+A-MSDU aggregation up to 7935 bytes is supported by the hardware on all
+bands, including HE-only 2.4 GHz operation, so advertise the capability
+unconditionally instead of gating it on the VHT capability word.
+
+Signed-off-by: Pi <pi@local>
+---
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -8428,8 +8428,10 @@ ath12k_mac_setup_ht_cap(struct ieee80211
+ 	if (ar_ht_cap & WMI_HT_CAP_L_SIG_TXOP_PROT)
+ 		ht_cap.cap |= IEEE80211_HT_CAP_LSIG_TXOP_PROT;
+ 
+-	if (ar_vht_cap & WMI_VHT_CAP_MAX_MPDU_LEN_MASK)
+-		ht_cap.cap |= IEEE80211_HT_CAP_MAX_AMSDU;
++	/* A-MSDUs up to 7935 bytes are supported on every band, including
++	 * 2.4 GHz HE-only radios which report no VHT capabilities at all.
++	 */
++	ht_cap.cap |= IEEE80211_HT_CAP_MAX_AMSDU;
+ 
+ 	for (i = 0; i < ar->num_rx_chains; i++) {
+ 		if (rate_cap_rx_chainmask & BIT(i))

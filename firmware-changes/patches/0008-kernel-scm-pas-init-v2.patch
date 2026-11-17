@@ -1,0 +1,58 @@
+From: pi <pi@local>
+Subject: [PATCH] firmware: qcom_scm: try PIL PAS_INIT_IMAGE v2 before the legacy call
+
+Some IPQ53xx TrustZone images reject the legacy PAS init command (svc 0x02,
+cmd 0x01, 2 args) with a bare -1, which qcom_scm_remap_error() turns into
+-EIO and makes the WCSS/MPD remoteproc probe fail. The vendor 5.4 kernel on
+these boards issues cmd 0x1a with three arguments (pas id, metadata phys,
+metadata length) and only falls back to the legacy command.
+
+Try the v2 command first and fall back to the legacy one, keeping the
+original behaviour if v2 is unsupported.
+
+Signed-off-by: pi <pi@local>
+---
+--- a/drivers/firmware/qcom/qcom_scm.h
++++ b/drivers/firmware/qcom/qcom_scm.h
+@@ -100,6 +100,9 @@
+ 
+ #define QCOM_SCM_SVC_PIL		0x02
+ #define QCOM_SCM_PIL_PAS_INIT_IMAGE	0x01
++/* Variant used by TZ images which want the metadata length passed
++ * explicitly instead of relying on the SCM buffer convention (IPQ53xx). */
++#define QCOM_SCM_PIL_PAS_INIT_IMAGE_V2	0x1a
+ #define QCOM_SCM_PIL_PAS_MEM_SETUP	0x02
+ #define QCOM_SCM_PIL_PAS_AUTH_AND_RESET	0x05
+ #define QCOM_SCM_PIL_PAS_SHUTDOWN	0x06
+--- a/drivers/firmware/qcom/qcom_scm.c
++++ b/drivers/firmware/qcom/qcom_scm.c
+@@ -663,7 +663,29 @@
+ 
+ 	desc.args[1] = mdata_phys;
+ 
++	/*
++	 * Some TrustZone images (observed on IPQ53xx) do not implement the
++	 * legacy PAS init command, but do implement the "v2" variant which
++	 * carries the metadata length as an explicit third argument.  Try
++	 * that first, then fall back to the legacy call.
++	 */
++	desc.cmd = QCOM_SCM_PIL_PAS_INIT_IMAGE_V2;
++	desc.arginfo = QCOM_SCM_ARGS(3, QCOM_SCM_VAL, QCOM_SCM_RW, QCOM_SCM_VAL);
++	desc.args[2] = size;
++
+ 	ret = qcom_scm_call(__scm->dev, &desc, &res);
++	dev_info(__scm->dev, "pas init image v2: pas_id=%u len=%zu ret=%d res=%lld\n",
++		 pas_id, size, ret, res.result[0]);
++	if (ret) {
++		desc.cmd = QCOM_SCM_PIL_PAS_INIT_IMAGE;
++		desc.arginfo = QCOM_SCM_ARGS(2, QCOM_SCM_VAL, QCOM_SCM_RW);
++		desc.args[2] = 0;
++
++		ret = qcom_scm_call(__scm->dev, &desc, &res);
++		dev_info(__scm->dev, "pas init image v1 fallback: ret=%d res=%lld\n",
++			 ret, res.result[0]);
++	}
++
+ 	qcom_scm_bw_disable();
+ 
+ disable_clk:

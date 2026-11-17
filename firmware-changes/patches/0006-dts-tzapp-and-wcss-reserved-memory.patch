@@ -1,0 +1,121 @@
+diff --git a/target/linux/qualcommbe/dts/ipq5322-re-cs-06.dts b/target/linux/qualcommbe/dts/ipq5322-re-cs-06.dts
+index 6baea3807..8782385d0 100644
+--- a/target/linux/qualcommbe/dts/ipq5322-re-cs-06.dts
++++ b/target/linux/qualcommbe/dts/ipq5322-re-cs-06.dts
+@@ -226,6 +226,22 @@
+ 	};
+ };
+ 
++/*
++ * 与 VIKINGYFY/immortalwrt 的 target 保持一致：sbl 与 Q6 保留区
++ * （48 MiB，上游 "reserve 48 MiB for Q6 bring-up"）显式声明，
++ * tzapp 地址修正在 ipq5332-common.dtsi 里完成。
++ */
++&{/reserved-memory} {
++	sbl@4a500000 {
++		reg = <0x0 0x4a500000 0x0 0x00100000>;
++		no-map;
++	};
++};
++
++&q6_region {
++	reg = <0x0 0x4a900000 0x0 0x03000000>;
++};
++
+ &wifi0 {
+ 	qcom,board-id = <22>;
+ 	nvmem-cells = <&lan_macaddr 2>;
+diff --git a/target/linux/qualcommbe/dts/ipq5332-common-wifi.dtsi b/target/linux/qualcommbe/dts/ipq5332-common-wifi.dtsi
+index 006dbb149..f653dced8 100644
+--- a/target/linux/qualcommbe/dts/ipq5332-common-wifi.dtsi
++++ b/target/linux/qualcommbe/dts/ipq5332-common-wifi.dtsi
+@@ -1,41 +1,9 @@
+ // SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause)
+ 
+-/ {
+-	/*
+-	 * WCSS/MLO layout for the SoC AHB radio.  The IPQ5332 WLAN firmware
+-	 * has a fixed UserPD host-DDR contract at 0x4b500000.  Keep that
+-	 * address through a bounded 12 MiB offset into the root WCSS
+-	 * reservation inherited from ipq5332.dtsi. Both consumers reference
+-	 * that one reservation; the host view must not reserve it again.
+-	 *
+-	 * The 5 GHz QCN6224 is exposed by ath12k as QCN9274 (PCI ID
+-	 * 17cb:1109) and keeps its firmware in a separate host-DDR window.
+-	 */
+-	reserved-memory {
+-		m3_dump: m3-dump@4da00000 {
+-			reg = <0x0 0x4da00000 0x0 0x00100000>;
+-			no-map;
+-		};
+-
+-		q6_caldb: q6-caldb@4db00000 {
+-			reg = <0x0 0x4db00000 0x0 0x00500000>;
+-			no-map;
+-		};
+-
+-		mlo_mem: mlo-global-mem@4e000000 {
+-			reg = <0x0 0x4e000000 0x0 0x01200000>;
+-			no-map;
+-		};
+-
+-		qcn9274_host_ddr: qcn9274-host-ddr@4f200000 {
+-			/* Firmware mode 1 uses 0x02402000 bytes (log-02). Keep
+-			 * almost 2 MiB headroom without reserving the old 50 MiB.
+-			 */
+-			reg = <0x0 0x4f200000 0x0 0x02600000>;
+-			no-map;
+-		};
+-	};
+-};
++/* WCSS/MLO 布局与 VIKINGYFY/immortalwrt target 保持一致：
++ * M3 dump、CALDB、MLO 共享池由驱动按需分配，不单独保留；
++ * QCN9274（PCI）也不使用固定 host-DDR 保留窗口。
++ */
+ 
+ &pcie1 {
+ 	status = "okay";
+@@ -50,11 +18,9 @@
+ 		wifi1: wifi@0 {
+ 			compatible = "pci17cb,1109";
+ 			reg = <0x00000000 0 0 0 0>;
+-			memory-region = <&qcn9274_host_ddr>, <&mlo_mem>;
+-			memory-region-names = "host-ddr-mem", "mlo-global-mem";
+-			qcom,ath12k-fw-memory-mode = <1>;
+-			qcom,ath12k-low-memory;
+ 			qcom,num-radios = <1>;
++			qcom,ath12k-fw-memory-mode = <1>;
++			qcom,rx-skb-slab;
+ 
+ 			ports {
+ 				#address-cells = <1>;
+@@ -97,10 +63,10 @@
+ 	status = "okay";
+ 
+ 	firmware-name = "ath12k/IPQ5332/hw1.0/q6_fw1.mdt", "ath12k/IPQ5332/hw1.0/iu_fw.mdt";
+-	memory-region = <&q6_region>, <&q6_region>, <&m3_dump>, <&q6_caldb>, <&mlo_mem>;
+-	memory-region-names = "q6-region", "host-ddr-mem", "m3-dump", "q6-caldb", "mlo-global-mem";
+-	/* Reduce host rings only: the AHB firmware retains memory mode 0. */
+-	qcom,ath12k-low-memory;
++	memory-region = <&q6_region>, <&q6_region>;
++	memory-region-names = "q6-region", "host-ddr-mem";
++	qcom,ath12k-fw-memory-mode = <1>;
++	qcom,rx-skb-slab;
+ 	qcom,host-ddr-offset = <0x00c00000>;
+ 	qcom,rproc = <&q6v5_wcss>;
+ 	qcom,wsi-controller;
+diff --git a/target/linux/qualcommbe/dts/ipq5332-common.dtsi b/target/linux/qualcommbe/dts/ipq5332-common.dtsi
+index 4c1ee83c1..4a8053206 100644
+--- a/target/linux/qualcommbe/dts/ipq5332-common.dtsi
++++ b/target/linux/qualcommbe/dts/ipq5332-common.dtsi
+@@ -16,8 +16,8 @@
+ 	};
+ 
+ 	reserved-memory {
+-		tzapp: tzapp@4d400000 {
+-			reg = <0x0 0x4d400000 0x0 0x00600000>;
++		tzapp: tzapp@49b00000 {
++			reg = <0x0 0x49b00000 0x0 0x00600000>;
+ 			no-map;
+ 		};
+ 	};

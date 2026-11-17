@@ -1,0 +1,23 @@
+#!/bin/sh
+# 默认中文界面 + 中国时区（首次启动生效，仅执行一次）
+# LuCI dispatcher 会把 'zh_cn' 转成 'zh-cn' 查找 .lmo 翻译目录
+uci -q get luci.main >/dev/null || uci set luci.main=core
+uci set luci.main.lang='zh_cn'
+# 默认主题：Vantage（主题包自带 30_luci-theme-vantage 注册，本脚本编号更大，后执行覆盖）
+uci set luci.themes.Vantage='/luci-static/vantage'
+uci set luci.main.mediaurlbase='/luci-static/vantage'
+uci commit luci
+
+# 时区 / NTP / 主机名
+uci -q get system.ntp >/dev/null || uci set system.ntp=timeserver
+uci set system.@system[0].hostname='JDCloud-BE6500'
+uci set system.@system[0].timezone='CST-8'
+uci set system.@system[0].zonename='Asia/Shanghai'
+uci -q delete system.ntp.server 2>/dev/null
+uci add_list system.ntp.server='ntp.ntsc.ac.cn'
+uci add_list system.ntp.server='cn.pool.ntp.org'
+uci add_list system.ntp.server='ntp.aliyun.com'
+uci add_list system.ntp.server='time1.cloud.tencent.com'
+uci commit system
+
+exit 0

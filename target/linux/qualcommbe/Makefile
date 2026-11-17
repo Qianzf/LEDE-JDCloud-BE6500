@@ -15,7 +15,7 @@ DEFAULT_PACKAGES += \
 	kmod-usb3 kmod-usb-dwc3 kmod-usb-dwc3-qcom \
 	kmod-leds-gpio kmod-gpio-button-hotplug \
 	kmod-qcom-ppe \
-	wpad-basic-mbedtls uboot-envtools \
+	wpad-mbedtls uboot-envtools \
 	e2fsprogs kmod-fs-ext4 losetup
 
 $(eval $(call BuildTarget))

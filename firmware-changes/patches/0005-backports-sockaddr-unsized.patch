@@ -1,0 +1,31 @@
+From: coolsnowwolf <coolsnowwolf@gmail.com>
+Subject: [PATCH] backport-include: net.h: forward declare struct sockaddr_unsized
+
+struct sockaddr_unsized was only introduced in Linux 6.19, but the
+kernel_connect() compatibility shim for older kernels already uses the
+new type in its prototype.
+
+On an older kernel the type therefore gets implicitly declared inside the
+parameter list, which creates a type distinct from the one ath12k casts to
+in drivers/net/wireless/ath/ath12k/qmi.c, so the driver fails to build:
+
+  qmi.c:4382:45: error: passing argument 2 of 'backport_kernel_connect'
+  from incompatible pointer type [-Werror=incompatible-pointer-types]
+
+Forward declare the struct inside the version guard so that both sides
+refer to the same type and ath12k keeps building on 6.18.
+
+---
+--- a/backport-include/linux/net.h
++++ b/backport-include/linux/net.h
+@@ -10,6 +10,10 @@
+  * The in-kernel socket API takes struct sockaddr_unsized since 6.19.
+  * Older kernels still expect struct sockaddr here.
+  */
++/* Kernels older than 6.19 do not define struct sockaddr_unsized at all,
++ * forward declare it so drivers using the newer API still compile. */
++struct sockaddr_unsized;
++
+ static inline int backport_kernel_connect(struct socket *sock,
+ 					  struct sockaddr_unsized *addr,
+ 					  int addrlen, int flags)

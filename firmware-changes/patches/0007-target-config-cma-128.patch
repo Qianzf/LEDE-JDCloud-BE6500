@@ -1,0 +1,13 @@
+diff --git a/target/linux/qualcommbe/config-6.18 b/target/linux/qualcommbe/config-6.18
+index 3ea579523..c1edfeb67 100644
+--- a/target/linux/qualcommbe/config-6.18
++++ b/target/linux/qualcommbe/config-6.18
+@@ -654,7 +654,7 @@ CONFIG_CMA=y
+ CONFIG_CMA_ALIGNMENT=8
+ CONFIG_CMA_AREAS=19
+ # CONFIG_CMA_DEBUGFS is not set
+-CONFIG_CMA_SIZE_MBYTES=64
++CONFIG_CMA_SIZE_MBYTES=128
+ CONFIG_CMA_SIZE_SEL_MBYTES=y
+ # CONFIG_CMA_SIZE_SEL_PERCENTAGE is not set
+ # CONFIG_CMA_SIZE_SEL_MIN is not set

@@ -1,0 +1,2049 @@
+diff --git a/package/kernel/mac80211/patches-qualcommbe/ath12k/313-ath12k-allow-dt-memory-mode-override.patch b/package/kernel/mac80211/patches-qualcommbe/ath12k/313-ath12k-allow-dt-memory-mode-override.patch
+index 00be99b74..8544587c0 100644
+--- a/package/kernel/mac80211/patches-qualcommbe/ath12k/313-ath12k-allow-dt-memory-mode-override.patch
++++ b/package/kernel/mac80211/patches-qualcommbe/ath12k/313-ath12k-allow-dt-memory-mode-override.patch
+@@ -1,22 +1,25 @@
+ From: JiaY-shi <shi05275@163.com>
+-Date: Sat, 25 Jul 2026 00:30:00 +0800
+-Subject: [PATCH] wifi: ath12k: allow firmware memory mode override from DT
++Date: Sun, 08 Nov 2026 10:27:29 +0800
++Subject: [PATCH] wifi: ath12k: honor DT firmware memory modes on PCI and AHB
+ 
+ ath12k selects the QCN9274 firmware memory mode from total system RAM.
+ That heuristic cannot describe embedded designs where a discrete radio has
+ to share memory and firmware resources with an integrated radio.
+ 
+-Allow the board DTS to select one of the existing QMI memory modes. Keep the
+-automatic RAM-based selection when the property is absent or invalid.
++Allow a valid qcom,ath12k-fw-memory-mode property to select an existing
++QMI memory mode, and use the same selector from the WiFi-7 AHB probe.
++The AHB path previously ignored the property and always selected mode 0.
++
++Preserve the fixed AHB default when the property is missing or invalid;
++keep the RAM-based fallback for QCN9274 PCIe devices. This avoids changing
++the default of other integrated radios without an explicit DT override.
+ 
+ Signed-off-by: JiaY-shi <shi05275@163.com>
+----
+- drivers/net/wireless/ath/ath12k/core.c | 13 +++++++++++++
+- 1 file changed, 13 insertions(+)
++Signed-off-by: ViKing <viking.yfy@qq.com>
+ 
+ --- a/drivers/net/wireless/ath/ath12k/core.c
+ +++ b/drivers/net/wireless/ath/ath12k/core.c
+-@@ -1778,9 +1778,22 @@ static void ath12k_core_reset(struct wor
++@@ -1778,9 +1778,26 @@ static void ath12k_core_reset(struct wor
+  
+  enum ath12k_qmi_mem_mode ath12k_core_get_memory_mode(struct ath12k_base *ab)
+  {
+@@ -35,7 +38,22 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
+ +		ath12k_warn(ab, "ignoring unsupported firmware memory mode %u\n",
+ +			    mode);
+ +	}
+++
+++	/* Preserve the integrated-radio default without a valid DT override. */
+++	if (ab->hif.bus == ATH12K_BUS_AHB)
+++		return ATH12K_QMI_MEMORY_MODE_DEFAULT;
+ +
+  	si_meminfo(&si);
+  	total_ram = si.totalram * si.mem_unit;
+  
++--- a/drivers/net/wireless/ath/ath12k/wifi7/ahb.c
+++++ b/drivers/net/wireless/ath/ath12k/wifi7/ahb.c
++@@ -51,7 +51,7 @@ static int ath12k_wifi7_ahb_probe(struct
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++-	ab->target_mem_mode = ATH12K_QMI_MEMORY_MODE_DEFAULT;
+++	ab->target_mem_mode = ath12k_core_get_memory_mode(ab);
++ 	ab->hw_rev = hw_rev;
++ 
++ 	ret = ath12k_wifi7_hw_init(ab);
+diff --git a/package/kernel/mac80211/patches-qualcommbe/ath12k/315-01-ath12k-share-fixed-mlo-memory.patch b/package/kernel/mac80211/patches-qualcommbe/ath12k/315-01-ath12k-share-fixed-mlo-memory.patch
+deleted file mode 100644
+index 3fa07ca60..000000000
+--- a/package/kernel/mac80211/patches-qualcommbe/ath12k/315-01-ath12k-share-fixed-mlo-memory.patch
++++ /dev/null
+@@ -1,378 +0,0 @@
+-From: JiaY-shi <shi05275@163.com>
+-Date: Sat, 25 Jul 2026 18:00:00 +0800
+-Subject: [PATCH] wifi: ath12k: share fixed MLO memory in mixed bus groups
+-
+-IPQ5332 firmware uses fixed QMI memory and reserves its MLO global memory
+-in device tree. The fixed memory assignment path does not handle MLO
+-memory requests, so an IPQ5332/QCN9274 WSI group cannot give both devices
+-the same global memory addresses.
+-
+-The two firmwares can also describe the same global buffer with different
+-segment boundaries. IPQ5332 requests one contiguous segment, while QCN9274
+-splits the request after falling back to smaller QMI memory chunks. Map
+-the fixed region once and derive every segment address from its cumulative
+-offset so both layouts reference the same physical range.
+-
+-Record the allocation type and DMA owner on the group rather than deriving
+-it from the device which happens to release the memory; mixed AHB/PCI
+-groups can otherwise unmap the shared memory with the wrong API.
+-
+-Signed-off-by: JiaY-shi <shi05275@163.com>
+----
+- drivers/net/wireless/ath/ath12k/core.h |   2 +
+- drivers/net/wireless/ath/ath12k/qmi.c  | 248 ++++++++++++++++++++++++++------
+- 2 files changed, 202 insertions(+), 48 deletions(-)
+-
+---- a/drivers/net/wireless/ath/ath12k/core.h
+-+++ b/drivers/net/wireless/ath/ath12k/core.h
+-@@ -889,6 +889,8 @@ struct ath12k_mlo_memory {
+- 	struct target_mem_chunk chunk[ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01];
+- 	int mlo_mem_size;
+- 	bool init_done;
+-+	bool fixed_mem;
+-+	struct device *alloc_dev;
+- };
+- 
+- struct ath12k_hw_link {
+---- a/drivers/net/wireless/ath/ath12k/qmi.c
+-+++ b/drivers/net/wireless/ath/ath12k/qmi.c
+-@@ -2508,11 +2508,16 @@ void ath12k_qmi_reset_mlo_mem(struct ath
+- 	for (i = 0; i < ARRAY_SIZE(ag->mlo_mem.chunk); i++) {
+- 		mlo_chunk = &ag->mlo_mem.chunk[i];
+- 
+--		if (mlo_chunk->v.addr)
+--			/* TODO: Mode 0 recovery is the default mode hence resetting the
+--			 * whole memory region for now. Once Mode 1 support is added, this
+--			 * needs to be handled properly
+--			 */
+-+		if (!mlo_chunk->v.addr)
+-+			continue;
+-+
+-+		/* TODO: Mode 0 recovery is the default mode hence resetting the
+-+		 * whole memory region for now. Once Mode 1 support is added, this
+-+		 * needs to be handled properly
+-+		 */
+-+		if (ag->mlo_mem.fixed_mem)
+-+			memset_io(mlo_chunk->v.ioaddr, 0, mlo_chunk->size);
+-+		else
+- 			memset(mlo_chunk->v.addr, 0, mlo_chunk->size);
+- 	}
+- }
+-@@ -2523,38 +2528,37 @@ static void ath12k_qmi_free_mlo_mem_chun
+- {
+- 	struct ath12k_hw_group *ag = ab->ag;
+- 	struct target_mem_chunk *mlo_chunk;
+--	bool fixed_mem;
+-+	struct device *alloc_dev;
+- 
+- 	lockdep_assert_held(&ag->mutex);
+- 
+- 	if (!ag->mlo_mem.init_done || ag->num_started)
+- 		return;
+- 
+--	if (idx >= ARRAY_SIZE(ag->mlo_mem.chunk)) {
+-+	if (ag->mlo_mem.fixed_mem) {
+-+		mlo_chunk = &ag->mlo_mem.chunk[0];
+-+		if (!idx && mlo_chunk->v.ioaddr) {
+-+			iounmap(mlo_chunk->v.ioaddr);
+-+			memset(mlo_chunk, 0, sizeof(*mlo_chunk));
+-+		}
+-+	} else if (idx >= ARRAY_SIZE(ag->mlo_mem.chunk)) {
+- 		ath12k_warn(ab, "invalid index for MLO memory chunk free: %d\n", idx);
+- 		return;
+--	}
+-+	} else {
+-+		mlo_chunk = &ag->mlo_mem.chunk[idx];
+-+		if (!mlo_chunk->v.addr)
+-+			goto clear_chunk;
+- 
+--	fixed_mem = test_bit(ATH12K_FLAG_FIXED_MEM_REGION, &ab->dev_flags);
+--	mlo_chunk = &ag->mlo_mem.chunk[idx];
+--
+--	if (fixed_mem && mlo_chunk->v.ioaddr) {
+--		iounmap(mlo_chunk->v.ioaddr);
+--		mlo_chunk->v.ioaddr = NULL;
+--	} else if (mlo_chunk->v.addr) {
+--		dma_free_coherent(ab->dev,
+-+		alloc_dev = ag->mlo_mem.alloc_dev ?: ab->dev;
+-+		dma_free_coherent(alloc_dev,
+- 				  mlo_chunk->size,
+- 				  mlo_chunk->v.addr,
+- 				  mlo_chunk->paddr);
+--		mlo_chunk->v.addr = NULL;
+-+		memset(mlo_chunk, 0, sizeof(*mlo_chunk));
+- 	}
+- 
+--	mlo_chunk->paddr = 0;
+--	mlo_chunk->size = 0;
+--	if (fixed_mem)
+--		chunk->v.ioaddr = NULL;
+--	else
+--		chunk->v.addr = NULL;
+-+clear_chunk:
+-+	chunk->v.addr = NULL;
+- 	chunk->paddr = 0;
+- 	chunk->size = 0;
+- }
+-@@ -2566,9 +2570,11 @@ static void ath12k_qmi_free_target_mem_c
+- 
+- 	for (i = 0, mlo_idx = 0; i < ab->qmi.mem_seg_count; i++) {
+- 		if (ab->qmi.target_mem[i].type == MLO_GLOBAL_MEM_REGION_TYPE) {
+--			ath12k_qmi_free_mlo_mem_chunk(ab,
+--						      &ab->qmi.target_mem[i],
+--						      mlo_idx++);
+-+			if (ab->qmi.target_mem[i].paddr)
+-+				ath12k_qmi_free_mlo_mem_chunk(ab,
+-+							      &ab->qmi.target_mem[i],
+-+							      mlo_idx);
+-+			mlo_idx++;
+- 		} else {
+- 			if (test_bit(ATH12K_FLAG_FIXED_MEM_REGION, &ab->dev_flags) &&
+- 			    ab->qmi.target_mem[i].v.ioaddr) {
+-@@ -2589,6 +2595,8 @@ static void ath12k_qmi_free_target_mem_c
+- 	if (!ag->num_started && ag->mlo_mem.init_done) {
+- 		ag->mlo_mem.init_done = false;
+- 		ag->mlo_mem.mlo_mem_size = 0;
+-+		ag->mlo_mem.fixed_mem = false;
+-+		ag->mlo_mem.alloc_dev = NULL;
+- 	}
+- }
+- 
+-@@ -2633,9 +2641,118 @@ this_chunk_done:
+- 	return 0;
+- }
+- 
+-+static int ath12k_qmi_get_mlo_reserved_mem(struct ath12k_hw_group *ag,
+-+					    struct reserved_mem **rmem)
+-+{
+-+	struct ath12k_base *partner_ab;
+-+	bool fixed_mem = false;
+-+	int i;
+-+
+-+	lockdep_assert_held(&ag->mutex);
+-+	*rmem = NULL;
+-+
+-+	for (i = 0; i < ag->num_devices; i++) {
+-+		partner_ab = ag->ab[i];
+-+		if (!partner_ab ||
+-+		    !test_bit(ATH12K_FLAG_FIXED_MEM_REGION,
+-+			      &partner_ab->dev_flags))
+-+			continue;
+-+
+-+		fixed_mem = true;
+-+
+-+		/* The IPQ5332 binding defines MLO global memory as region 3. */
+-+		*rmem = ath12k_core_get_reserved_mem(partner_ab, 3);
+-+		if (*rmem)
+-+			return 0;
+-+	}
+-+
+-+	return fixed_mem ? -ENODEV : 0;
+-+}
+-+
+-+static int ath12k_qmi_assign_mlo_mem_chunk(struct ath12k_base *ab,
+-+					    struct target_mem_chunk *chunk,
+-+					    int idx, size_t offset, u32 size)
+-+{
+-+	struct ath12k_hw_group *ag = ab->ag;
+-+	struct target_mem_chunk *mlo_chunk;
+-+	struct reserved_mem *rmem;
+-+	int ret;
+-+
+-+	lockdep_assert_held(&ag->mutex);
+-+
+-+	ret = ath12k_qmi_get_mlo_reserved_mem(ag, &rmem);
+-+	if (ret) {
+-+		ath12k_err(ab, "fixed MLO memory is missing from device tree\n");
+-+		return ret;
+-+	}
+-+
+-+	if (rmem) {
+-+		mlo_chunk = &ag->mlo_mem.chunk[0];
+-+		if (!mlo_chunk->v.ioaddr) {
+-+			mlo_chunk->paddr = rmem->base;
+-+			mlo_chunk->size = rmem->size;
+-+			mlo_chunk->type = MLO_GLOBAL_MEM_REGION_TYPE;
+-+			mlo_chunk->v.ioaddr = ioremap(rmem->base, rmem->size);
+-+			if (!mlo_chunk->v.ioaddr) {
+-+				memset(mlo_chunk, 0, sizeof(*mlo_chunk));
+-+				return -EIO;
+-+			}
+-+
+-+			ag->mlo_mem.fixed_mem = true;
+-+			memset_io(mlo_chunk->v.ioaddr, 0, mlo_chunk->size);
+-+			ath12k_info(ab, "mapped fixed MLO memory addr %pa size %u\n",
+-+				    &mlo_chunk->paddr, mlo_chunk->size);
+-+		}
+-+
+-+		if (offset > mlo_chunk->size || size > mlo_chunk->size - offset) {
+-+			ath12k_err(ab,
+-+				   "MLO request offset %zu size %u exceeds reserved size %u\n",
+-+				   offset, size, mlo_chunk->size);
+-+			return -EINVAL;
+-+		}
+-+
+-+		chunk->paddr = mlo_chunk->paddr + offset;
+-+		chunk->v.ioaddr = (u8 __iomem *)mlo_chunk->v.ioaddr + offset;
+-+		chunk->size = size;
+-+		chunk->type = MLO_GLOBAL_MEM_REGION_TYPE;
+-+		return 0;
+-+	}
+-+
+-+	if (idx >= ARRAY_SIZE(ag->mlo_mem.chunk)) {
+-+		ath12k_err(ab, "invalid index for MLO memory chunk: %d\n", idx);
+-+		return -EINVAL;
+-+	}
+-+
+-+	mlo_chunk = &ag->mlo_mem.chunk[idx];
+-+	if (mlo_chunk->paddr) {
+-+		if (size != mlo_chunk->size) {
+-+			ath12k_err(ab,
+-+				   "QMI MLO chunk %d size %u differs from %u\n",
+-+				   idx, size, mlo_chunk->size);
+-+			return -EINVAL;
+-+		}
+-+	} else {
+-+		mlo_chunk->size = size;
+-+		mlo_chunk->type = MLO_GLOBAL_MEM_REGION_TYPE;
+-+		ret = ath12k_qmi_alloc_chunk(ab, mlo_chunk);
+-+		if (ret)
+-+			return ret;
+-+		if (!ag->mlo_mem.alloc_dev)
+-+			ag->mlo_mem.alloc_dev = ab->dev;
+-+		memset(mlo_chunk->v.addr, 0, mlo_chunk->size);
+-+	}
+-+
+-+	chunk->paddr = mlo_chunk->paddr;
+-+	chunk->v.addr = mlo_chunk->v.addr;
+-+	chunk->size = size;
+-+	chunk->type = MLO_GLOBAL_MEM_REGION_TYPE;
+-+
+-+	return 0;
+-+}
+-+
+- static int ath12k_qmi_alloc_target_mem_chunk(struct ath12k_base *ab)
+- {
+--	struct target_mem_chunk *chunk, *mlo_chunk;
+-+	struct target_mem_chunk *chunk;
+- 	struct ath12k_hw_group *ag = ab->ag;
+- 	int i, mlo_idx, ret;
+- 	int mlo_size = 0;
+-@@ -2645,6 +2762,8 @@ static int ath12k_qmi_alloc_target_mem_c
+- 	if (!ag->mlo_mem.init_done) {
+- 		memset(ag->mlo_mem.chunk, 0, sizeof(ag->mlo_mem.chunk));
+- 		ag->mlo_mem.init_done = true;
+-+		ag->mlo_mem.fixed_mem = false;
+-+		ag->mlo_mem.alloc_dev = NULL;
+- 	}
+- 
+- 	ab->qmi.target_mem_delayed = false;
+-@@ -2676,25 +2795,11 @@ static int ath12k_qmi_alloc_target_mem_c
+- 				goto err;
+- 			}
+- 
+--			mlo_chunk = &ag->mlo_mem.chunk[mlo_idx];
+--			if (mlo_chunk->paddr) {
+--				if (chunk->size != mlo_chunk->size) {
+--					ath12k_err(ab, "QMI MLO chunk memory allocation failure for index %d, requested size %d is more than allocated size %d",
+--						   mlo_idx, chunk->size, mlo_chunk->size);
+--					ret = -EINVAL;
+--					goto err;
+--				}
+--			} else {
+--				mlo_chunk->size = chunk->size;
+--				mlo_chunk->type = chunk->type;
+--				ret = ath12k_qmi_alloc_chunk(ab, mlo_chunk);
+--				if (ret)
+--					goto err;
+--				memset(mlo_chunk->v.addr, 0, mlo_chunk->size);
+--			}
+--
+--			chunk->paddr = mlo_chunk->paddr;
+--			chunk->v.addr = mlo_chunk->v.addr;
+-+			ret = ath12k_qmi_assign_mlo_mem_chunk(ab, chunk, mlo_idx,
+-+							mlo_size - chunk->size,
+-+							chunk->size);
+-+			if (ret)
+-+				goto err;
+- 			mlo_idx++;
+- 
+- 			break;
+-@@ -2738,11 +2843,23 @@ err:
+- 
+- static int ath12k_qmi_assign_target_mem_chunk(struct ath12k_base *ab)
+- {
+-+	struct target_mem_chunk *chunk;
+-+	struct ath12k_hw_group *ag = ab->ag;
+- 	struct reserved_mem *rmem;
+- 	size_t avail_rmem_size;
+--	int i, idx, ret;
+-+	int i, idx, mlo_idx, ret;
+-+	int mlo_size = 0;
+- 
+--	for (i = 0, idx = 0; i < ab->qmi.mem_seg_count; i++) {
+-+	mutex_lock(&ag->mutex);
+-+
+-+	if (!ag->mlo_mem.init_done) {
+-+		memset(ag->mlo_mem.chunk, 0, sizeof(ag->mlo_mem.chunk));
+-+		ag->mlo_mem.init_done = true;
+-+		ag->mlo_mem.fixed_mem = false;
+-+		ag->mlo_mem.alloc_dev = NULL;
+-+	}
+-+
+-+	for (i = 0, idx = 0, mlo_idx = 0; i < ab->qmi.mem_seg_count; i++) {
+- 		switch (ab->qmi.target_mem[i].type) {
+- 		case HOST_DDR_REGION_TYPE:
+- 			rmem = ath12k_core_get_reserved_mem(ab, 0);
+-@@ -2816,6 +2933,28 @@ static int ath12k_qmi_assign_target_mem_
+- 			ab->qmi.target_mem[idx].type = ab->qmi.target_mem[i].type;
+- 			idx++;
+- 			break;
+-+		case MLO_GLOBAL_MEM_REGION_TYPE:
+-+			chunk = &ab->qmi.target_mem[i];
+-+			mlo_size += chunk->size;
+-+			if (ag->mlo_mem.mlo_mem_size &&
+-+			    mlo_size > ag->mlo_mem.mlo_mem_size) {
+-+				ath12k_err(ab,
+-+					   "QMI MLO memory request %d exceeds allocated size %d\n",
+-+					   mlo_size, ag->mlo_mem.mlo_mem_size);
+-+				ret = -EINVAL;
+-+				goto out;
+-+			}
+-+
+-+			ret = ath12k_qmi_assign_mlo_mem_chunk(ab,
+-+							&ab->qmi.target_mem[idx],
+-+							mlo_idx,
+-+							mlo_size - chunk->size,
+-+							chunk->size);
+-+			if (ret)
+-+				goto out;
+-+			idx++;
+-+			mlo_idx++;
+-+			break;
+- 		case M3_DUMP_REGION_TYPE:
+- 			rmem = ath12k_core_get_reserved_mem(ab, 1);
+- 			if (!rmem) {
+-@@ -2854,9 +2993,22 @@ static int ath12k_qmi_assign_target_mem_
+- 	}
+- 	ab->qmi.mem_seg_count = idx;
+- 
+-+	if (!ag->mlo_mem.mlo_mem_size) {
+-+		ag->mlo_mem.mlo_mem_size = mlo_size;
+-+	} else if (ag->mlo_mem.mlo_mem_size != mlo_size) {
+-+		ath12k_err(ab,
+-+			   "QMI MLO memory size error, expected %d requested %d\n",
+-+			   ag->mlo_mem.mlo_mem_size, mlo_size);
+-+		ret = -EINVAL;
+-+		goto out;
+-+	}
+-+
+-+	mutex_unlock(&ag->mutex);
+-+
+- 	return 0;
+- out:
+- 	ath12k_qmi_free_target_mem_chunk(ab);
+-+	mutex_unlock(&ag->mutex);
+- 	return ret;
+- }
+- 
+diff --git a/package/kernel/mac80211/patches-qualcommbe/ath12k/315-02-ath12k-rootpd-crash-recovery.patch b/package/kernel/mac80211/patches-qualcommbe/ath12k/315-02-ath12k-rootpd-crash-recovery.patch
+deleted file mode 100644
+index 1616e8387..000000000
+--- a/package/kernel/mac80211/patches-qualcommbe/ath12k/315-02-ath12k-rootpd-crash-recovery.patch
++++ /dev/null
+@@ -1,183 +0,0 @@
+-From: Akshay Kakatkar <me@kakatkarakshay.dev>
+-Date: Wed, 28 Oct 2026 13:34:14 +0800
+-Subject: [PATCH] wifi: ath12k: report rootPD crashes and recover the WSI group
+-
+-The AHB driver currently uses the Qualcomm SSR notifier only to wait for
+-rootPD startup. Handle crash shutdown notifications as well so the actual
+-failure is visible instead of only its later effects.
+-
+-The rootPD crash notifier currently releases the AHB userPD so remoteproc
+-can collect the complete q6wcss dump, but no ath12k recovery is started.
+-Remoteproc restarts only the rootPD. The AHB userPD remains down and PCIe
+-partners which did not independently report RDDM remain attached to the
+-stale WSI group, so wireless service does not return without a reboot.
+-
+-Merged from:
+-  315-02-ath12k-report-rootpd-crashes.patch
+-  316-ath12k-recover-rootpd-crashes.patch
+-
+-Based on work by:
+-  Akshay Kakatkar <me@kakatkarakshay.dev>
+-  Avula Sri Charan <quic_asrichar@quicinc.com>
+-  Sowmiya Sree Elavalagan <quic_ssreeela@quicinc.com>
+-
+-Link: https://github.com/Telecominfraproject/wlan-ap/blob/4dda11dcf7455828e03a753079c520701f2f7a7c/feeds/qca-wifi-7/mac80211/patches-qca/ath12k/0111-0017-QSDK-PLATFORM-wifi-ath12k-Register-and-handle-rootPD-crash.patch
+-
+-Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
+-Signed-off-by: Sowmiya Sree Elavalagan <quic_ssreeela@quicinc.com>
+-Signed-off-by: Avula Sri Charan <quic_asrichar@quicinc.com>
+-Signed-off-by: ViKing <viking.yfy@qq.com>
+-
+---- a/drivers/net/wireless/ath/ath12k/ahb.c
+-+++ b/drivers/net/wireless/ath/ath12k/ahb.c
+-@@ -357,6 +357,7 @@ static int ath12k_ahb_power_up(struct at
+- 	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
+- 	char fw_name[ATH12K_USERPD_FW_NAME_LEN];
+- 	char fw2_name[ATH12K_USERPD_FW_NAME_LEN];
+-+	bool spawn_requested = false;
+- 	struct device *dev = ab->dev;
+- 	const struct firmware *fw, *fw2;
+- 	struct reserved_mem *rmem = NULL;
+-@@ -453,6 +454,9 @@ static int ath12k_ahb_power_up(struct at
+- 		}
+- 	}
+- 
+-+	reinit_completion(&ab_ahb->userpd_spawned);
+-+	reinit_completion(&ab_ahb->userpd_ready);
+-+
+- 	/* Instruct Q6 to spawn userPD thread */
+- 	ret = qcom_smem_state_update_bits(ab_ahb->spawn_state, BIT(ab_ahb->spawn_bit),
+- 					  BIT(ab_ahb->spawn_bit));
+-@@ -460,6 +464,7 @@ static int ath12k_ahb_power_up(struct at
+- 		ath12k_err(ab, "Failed to update spawn state %d\n", ret);
+- 		goto err_fw2;
+- 	}
+-+	spawn_requested = true;
+- 
+- 	time_left = wait_for_completion_timeout(&ab_ahb->userpd_spawned,
+- 						ATH12K_USERPD_SPAWN_TIMEOUT);
+-@@ -477,11 +482,13 @@ static int ath12k_ahb_power_up(struct at
+- 		goto err_fw2;
+- 	}
+- 
+--	qcom_smem_state_update_bits(ab_ahb->spawn_state, BIT(ab_ahb->spawn_bit), 0);
+--
+-+	ab_ahb->rootpd_crashed = false;
+- 	ath12k_dbg(ab, ATH12K_DBG_AHB, "UserPD%d is now UP\n", ab_ahb->userpd_id);
+- 
+- err_fw2:
+-+	if (spawn_requested)
+-+		qcom_smem_state_update_bits(ab_ahb->spawn_state,
+-+					    BIT(ab_ahb->spawn_bit), 0);
+- 	release_firmware(fw2);
+- err_fw:
+- 	release_firmware(fw);
+-@@ -495,6 +502,10 @@ static void ath12k_ahb_power_down(struct
+- 	u32 pasid;
+- 	int ret;
+- 
+-+	if (ab_ahb->rootpd_crashed)
+-+		return;
+-+
+-+	reinit_completion(&ab_ahb->userpd_stopped);
+- 	qcom_smem_state_update_bits(ab_ahb->stop_state, BIT(ab_ahb->stop_bit),
+- 				    BIT(ab_ahb->stop_bit));
+- 
+-@@ -809,18 +820,85 @@ static int ath12k_ahb_config_rproc_irq(s
+- 	return 0;
+- }
+- 
+-+static void ath12k_ahb_release_crashed_userpd(struct ath12k_base *ab)
+-+{
+-+	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
+-+	u32 pasid;
+-+	int ret;
+-+
+-+	if (!ab_ahb->scm_auth_enabled)
+-+		return;
+-+
+-+	pasid = u32_encode_bits(ab_ahb->userpd_id, ATH12K_USERPD_ID_MASK) |
+-+		ATH12K_AHB_UPD_SWID;
+-+	ret = qcom_scm_pas_shutdown(pasid);
+-+	if (ret)
+-+		ath12k_warn(ab, "failed to release userPD%u after rootPD crash: %d\n",
+-+			    ab_ahb->userpd_id, ret);
+-+}
+-+
+-+static void ath12k_ahb_queue_group_recovery(struct ath12k_base *ab)
+-+{
+-+	struct ath12k_hw_group *ag = ab->ag;
+-+	struct ath12k_base *partner_ab;
+-+	int i;
+-+
+-+	if (!ag)
+-+		return;
+-+
+-+	mutex_lock(&ag->mutex);
+-+	for (i = 0; i < ag->num_devices; i++) {
+-+		partner_ab = ag->ab[i];
+-+		if (!partner_ab ||
+-+		    !test_bit(ATH12K_FLAG_REGISTERED, &partner_ab->dev_flags) ||
+-+		    test_bit(ATH12K_FLAG_UNREGISTERING, &partner_ab->dev_flags))
+-+			continue;
+-+
+-+		set_bit(ATH12K_FLAG_CRASH_FLUSH, &partner_ab->dev_flags);
+-+		set_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags);
+-+
+-+		if (READ_ONCE(partner_ab->is_reset) ||
+-+		    work_busy(&partner_ab->reset_work))
+-+			continue;
+-+
+-+		queue_work(partner_ab->workqueue_aux, &partner_ab->reset_work);
+-+	}
+-+	mutex_unlock(&ag->mutex);
+-+}
+-+
+- static int ath12k_ahb_root_pd_state_notifier(struct notifier_block *nb,
+- 					     const unsigned long event, void *data)
+- {
+- 	struct ath12k_ahb *ab_ahb = container_of(nb, struct ath12k_ahb, root_pd_nb);
+- 	struct ath12k_base *ab = ab_ahb->ab;
+-+	struct qcom_ssr_notify_data *notify_data = data;
+- 
+--	if (event == ATH12K_RPROC_AFTER_POWERUP) {
+-+	switch (event) {
+-+	case QCOM_SSR_AFTER_POWERUP:
+- 		ath12k_dbg(ab, ATH12K_DBG_AHB, "Root PD is UP\n");
+- 		complete(&ab_ahb->rootpd_ready);
+-+		if (ab_ahb->rootpd_crashed)
+-+			ath12k_ahb_queue_group_recovery(ab);
+-+		return NOTIFY_OK;
+-+	case QCOM_SSR_BEFORE_SHUTDOWN:
+-+		if (!notify_data || !notify_data->crashed)
+-+			return NOTIFY_DONE;
+-+
+-+		reinit_completion(&ab_ahb->rootpd_ready);
+-+		ab_ahb->rootpd_crashed = true;
+-+
+-+		if (test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags) &&
+-+		    !test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags)) {
+-+			set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+-+			set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+-+		}
+-+
+-+		ath12k_warn(ab, "rootPD crashed; releasing userPD for coredump\n");
+-+		ath12k_ahb_release_crashed_userpd(ab);
+-+		return NOTIFY_OK;
+- 	}
+- 
+--	return 0;
+-+	return NOTIFY_DONE;
+- }
+- 
+- static int ath12k_ahb_register_rproc_notifier(struct ath12k_base *ab)
+---- a/drivers/net/wireless/ath/ath12k/ahb.h
+-+++ b/drivers/net/wireless/ath/ath12k/ahb.h
+-@@ -69,6 +69,7 @@ struct ath12k_ahb {
+- 	const struct ath12k_ahb_ops *ahb_ops;
+- 	const struct ath12k_ahb_device_family_ops *device_family_ops;
+- 	bool scm_auth_enabled;
+-+	bool rootpd_crashed;
+- };
+- 
+- struct ath12k_ahb_driver {
+diff --git a/package/kernel/mac80211/patches-qualcommbe/ath12k/317-ath12k-use-reserved-pci-host-ddr.patch b/package/kernel/mac80211/patches-qualcommbe/ath12k/317-ath12k-use-reserved-pci-host-ddr.patch
+deleted file mode 100644
+index 90a8bf3b9..000000000
+--- a/package/kernel/mac80211/patches-qualcommbe/ath12k/317-ath12k-use-reserved-pci-host-ddr.patch
++++ /dev/null
+@@ -1,249 +0,0 @@
+-From: JiaY-shi <shi05275@163.com>
+-Date: Sat, 25 Jul 2026 21:00:00 +0800
+-Subject: [PATCH] wifi: ath12k: use fixed host DDR for PCI firmware
+-
+-QCN9274 firmware initially requests large contiguous host, pageable and
+-dump buffers.  Without a reserved region the host allocation can fail and
+-firmware retries with small chunks, including splitting the MLO global
+-memory request.  An IPQ5332 partner requests that shared memory as one
+-chunk, so the two devices then describe incompatible layouts.
+-
+-Follow the Qualcomm platform implementation and use named reserved memory
+-directly for PCI QMI target-memory requests, including the two 4 KiB
+-AFC slots requested even by 5 GHz firmware. Reject oversized AFC requests
+-and include the chunk in the existing remote-memory coredump TLV. Keep MLO
+-global memory in its own named region so all devices in the WSI group
+-receive identical physical addresses.
+-
+-Signed-off-by: JiaY-shi <shi05275@163.com>
+-
+----
+---- a/drivers/net/wireless/ath/ath12k/core.c
+-+++ b/drivers/net/wireless/ath/ath12k/core.c
+-@@ -664,6 +664,33 @@ struct reserved_mem *ath12k_core_get_res
+- 	return rmem;
+- }
+- 
+-+struct reserved_mem *ath12k_core_get_rmem_by_name(struct ath12k_base *ab, const char *name)
+-+{
+-+	struct device_node *node;
+-+	struct reserved_mem *rmem;
+-+	int index;
+-+
+-+	index = of_property_match_string(ab->dev->of_node,
+-+					 "memory-region-names", name);
+-+	if (index < 0)
+-+		return NULL;
+-+
+-+	node = of_parse_phandle(ab->dev->of_node, "memory-region", index);
+-+	if (!node) {
+-+		ath12k_dbg(ab, ATH12K_DBG_BOOT,
+-+			   "failed to parse memory region %s\n", name);
+-+		return NULL;
+-+	}
+-+
+-+	rmem = of_reserved_mem_lookup(node);
+-+	of_node_put(node);
+-+	if (!rmem)
+-+		ath12k_dbg(ab, ATH12K_DBG_BOOT,
+-+			   "unable to get memory region %s\n", name);
+-+
+-+	return rmem;
+-+}
+-+
+- static inline
+- void ath12k_core_to_group_ref_get(struct ath12k_base *ab)
+- {
+-@@ -2367,6 +2394,14 @@ struct ath12k_base *ath12k_core_alloc(st
+- 	ab->qmi.num_radios = U8_MAX;
+- 	ab->single_chip_mlo_support = false;
+- 
+-+	/* Qualcomm platform firmware expects PCI target memory to come from
+-+	 * the reserved host DDR region instead of fragmented coherent DMA.
+-+	 */
+-+	if (bus == ATH12K_BUS_PCI &&
+-+	    of_property_match_string(dev->of_node, "memory-region-names",
+-+				     "host-ddr-mem") >= 0)
+-+		set_bit(ATH12K_FLAG_FIXED_MEM_REGION, &ab->dev_flags);
+-+
+- 	/* Device index used to identify the devices in a group.
+- 	 *
+- 	 * In Intra-device MLO, only one device present in a group,
+---- a/drivers/net/wireless/ath/ath12k/core.h
+-+++ b/drivers/net/wireless/ath/ath12k/core.h
+-@@ -1307,6 +1307,7 @@ void ath12k_fw_stats_free(struct ath12k_
+- void ath12k_fw_stats_reset(struct ath12k *ar);
+- struct reserved_mem *ath12k_core_get_reserved_mem(struct ath12k_base *ab,
+- 						  int index);
+-+struct reserved_mem *ath12k_core_get_rmem_by_name(struct ath12k_base *ab, const char *name);
+- enum ath12k_qmi_mem_mode ath12k_core_get_memory_mode(struct ath12k_base *ab);
+- 
+- static inline const char *ath12k_scan_state_str(enum ath12k_scan_state state)
+---- a/drivers/net/wireless/ath/ath12k/coredump.c
+-+++ b/drivers/net/wireless/ath/ath12k/coredump.c
+-@@ -15,6 +15,7 @@ ath12k_fw_crash_dump_type ath12k_coredum
+- 
+- 	switch (type) {
+- 	case HOST_DDR_REGION_TYPE:
+-+	case AFC_REGION_TYPE:
+- 		dump_type = FW_CRASH_DUMP_REMOTE_MEM_DATA;
+- 		break;
+- 	case M3_DUMP_REGION_TYPE:
+---- a/drivers/net/wireless/ath/ath12k/qmi.c
+-+++ b/drivers/net/wireless/ath/ath12k/qmi.c
+-@@ -2660,8 +2660,7 @@ static int ath12k_qmi_get_mlo_reserved_m
+- 
+- 		fixed_mem = true;
+- 
+--		/* The IPQ5332 binding defines MLO global memory as region 3. */
+--		*rmem = ath12k_core_get_reserved_mem(partner_ab, 3);
+-+		*rmem = ath12k_core_get_rmem_by_name(partner_ab, "mlo-global-mem");
+- 		if (*rmem)
+- 			return 0;
+- 	}
+-@@ -2841,6 +2840,114 @@ err:
+- 	return ret;
+- }
+- 
+-+static int ath12k_qmi_assign_pci_target_mem_chunk(struct ath12k_base *ab)
+-+{
+-+	struct ath12k_hw_group *ag = ab->ag;
+-+	struct reserved_mem *host_rmem;
+-+	struct target_mem_chunk *chunk;
+-+	size_t host_offset = 0;
+-+	size_t mlo_offset;
+-+	int i, mlo_idx = 0;
+-+	int mlo_size = 0;
+-+	int ret = 0;
+-+
+-+	host_rmem = ath12k_core_get_rmem_by_name(ab, "host-ddr-mem");
+-+	if (!host_rmem)
+-+		return -ENODEV;
+-+
+-+	mutex_lock(&ag->mutex);
+-+
+-+	if (!ag->mlo_mem.init_done) {
+-+		memset(ag->mlo_mem.chunk, 0, sizeof(ag->mlo_mem.chunk));
+-+		ag->mlo_mem.init_done = true;
+-+		ag->mlo_mem.fixed_mem = false;
+-+		ag->mlo_mem.alloc_dev = NULL;
+-+	}
+-+
+-+	for (i = 0; i < ab->qmi.mem_seg_count; i++) {
+-+		chunk = &ab->qmi.target_mem[i];
+-+
+-+		switch (chunk->type) {
+-+		case AFC_REGION_TYPE:
+-+			if (chunk->size > AFC_MEM_SIZE) {
+-+				ath12k_err(ab,
+-+					   "AFC memory request size %u exceeds limit %u\n",
+-+					   chunk->size, AFC_MEM_SIZE);
+-+				ret = -EINVAL;
+-+				goto out;
+-+			}
+-+			fallthrough;
+-+		case HOST_DDR_REGION_TYPE:
+-+		case CALDB_MEM_REGION_TYPE:
+-+		case PAGEABLE_MEM_REGION_TYPE:
+-+		case M3_DUMP_REGION_TYPE:
+-+			if (host_offset > host_rmem->size ||
+-+			    chunk->size > host_rmem->size - host_offset) {
+-+				ath12k_err(ab,
+-+					   "PCI memory type %u offset %zu size %u exceeds host DDR size %pa\n",
+-+					   chunk->type, host_offset, chunk->size,
+-+					   &host_rmem->size);
+-+				ret = -EINVAL;
+-+				goto out;
+-+			}
+-+
+-+			chunk->paddr = host_rmem->base + host_offset;
+-+			chunk->v.ioaddr = ioremap(chunk->paddr, chunk->size);
+-+			if (!chunk->v.ioaddr) {
+-+				ret = -EIO;
+-+				goto out;
+-+			}
+-+			host_offset += chunk->size;
+-+			break;
+-+		case MLO_GLOBAL_MEM_REGION_TYPE:
+-+			mlo_size += chunk->size;
+-+			if (ag->mlo_mem.mlo_mem_size &&
+-+			    mlo_size > ag->mlo_mem.mlo_mem_size) {
+-+				ath12k_err(ab,
+-+					   "QMI MLO memory request %d exceeds allocated size %d\n",
+-+					   mlo_size, ag->mlo_mem.mlo_mem_size);
+-+				ret = -EINVAL;
+-+				goto out;
+-+			}
+-+
+-+			mlo_offset = mlo_size - chunk->size;
+-+			ret = ath12k_qmi_assign_mlo_mem_chunk(ab, chunk, mlo_idx,
+-+							      mlo_offset, chunk->size);
+-+			if (ret)
+-+				goto out;
+-+			mlo_idx++;
+-+			break;
+-+		default:
+-+			ath12k_warn(ab, "qmi ignore invalid PCI mem req type %u\n",
+-+				    chunk->type);
+-+			chunk->paddr = 0;
+-+			chunk->v.ioaddr = NULL;
+-+			break;
+-+		}
+-+	}
+-+
+-+	if (!ag->mlo_mem.mlo_mem_size) {
+-+		ag->mlo_mem.mlo_mem_size = mlo_size;
+-+	} else if (ag->mlo_mem.mlo_mem_size != mlo_size) {
+-+		ath12k_err(ab,
+-+			   "QMI MLO memory size error, expected %d requested %d\n",
+-+			   ag->mlo_mem.mlo_mem_size, mlo_size);
+-+		ret = -EINVAL;
+-+		goto out;
+-+	}
+-+
+-+	ath12k_info(ab, "using fixed PCI host DDR addr %pa size %pa used %zu\n",
+-+		    &host_rmem->base, &host_rmem->size, host_offset);
+-+	mutex_unlock(&ag->mutex);
+-+
+-+	return 0;
+-+
+-+out:
+-+	ath12k_qmi_free_target_mem_chunk(ab);
+-+	mutex_unlock(&ag->mutex);
+-+	return ret;
+-+}
+-+
+- static int ath12k_qmi_assign_target_mem_chunk(struct ath12k_base *ab)
+- {
+- 	struct target_mem_chunk *chunk;
+-@@ -2850,6 +2957,10 @@ static int ath12k_qmi_assign_target_mem_
+- 	int i, idx, mlo_idx, ret;
+- 	int mlo_size = 0;
+- 
+-+	if (ab->hif.bus == ATH12K_BUS_PCI &&
+-+	    test_bit(ATH12K_FLAG_FIXED_MEM_REGION, &ab->dev_flags))
+-+		return ath12k_qmi_assign_pci_target_mem_chunk(ab);
+-+
+- 	mutex_lock(&ag->mutex);
+- 
+- 	if (!ag->mlo_mem.init_done) {
+---- a/drivers/net/wireless/ath/ath12k/qmi.h
+-+++ b/drivers/net/wireless/ath/ath12k/qmi.h
+-@@ -29,6 +29,9 @@
+- #define ATH12K_QMI_FW_MEM_REQ_SEGMENT_CNT	3
+- #define ATH12K_QMI_WLFW_MAX_DEV_MEM_NUM_V01 4
+- #define ATH12K_QMI_DEVMEM_CMEM_INDEX	0
+-+#define AFC_SLOT_SIZE			0x1000
+-+#define AFC_MAX_SLOT			2
+-+#define AFC_MEM_SIZE			(AFC_SLOT_SIZE * AFC_MAX_SLOT)
+- 
+- #define QMI_WLFW_REQUEST_MEM_IND_V01		0x0035
+- #define QMI_WLFW_FW_MEM_READY_IND_V01		0x0037
+-@@ -178,6 +181,7 @@ enum ath12k_qmi_target_mem {
+- 	CALDB_MEM_REGION_TYPE = 0x4,
+- 	MLO_GLOBAL_MEM_REGION_TYPE = 0x8,
+- 	PAGEABLE_MEM_REGION_TYPE = 0x9,
+-+	AFC_REGION_TYPE = 0xa,
+- 	LPASS_SHARED_V01_REGION_TYPE = 0xb,
+- };
+- 
+diff --git a/package/kernel/mac80211/patches-qualcommbe/ath12k/330-ath12k-ahb-userpd-recovery.patch b/package/kernel/mac80211/patches-qualcommbe/ath12k/330-ath12k-ahb-userpd-recovery.patch
+index b9351e955..87a4d2b8e 100644
+--- a/package/kernel/mac80211/patches-qualcommbe/ath12k/330-ath12k-ahb-userpd-recovery.patch
++++ b/package/kernel/mac80211/patches-qualcommbe/ath12k/330-ath12k-ahb-userpd-recovery.patch
+@@ -1,5 +1,5 @@
+ From: JiaY-shi <shi05275@163.com>
+-Date: Wed, 28 Oct 2026 13:34:14 +0800
++Date: Wed, 11 Nov 2026 16:11:45 +0800
+ Subject: [PATCH] wifi: ath12k: recover AHB UserPD failures and independent reloads
+ 
+ The IPQ5332 DT exposes a UserPD fatal interrupt but ath12k only requests
+@@ -12,13 +12,17 @@ remoteproc disabled. Its q6_fw1.mdt is a standalone UserPD image and does
+ not contain the ASID-tagged writable segments required by the legacy BDMA
+ loader, so that loader must not be used for this firmware.
+ 
++Keep the final implementation of this responsibility directly; subsequent
++repairs listed below are integrated without intermediate replacements.
++
+ Merged from:
++  330-ath12k-ahb-userpd-recovery.patch - wifi: ath12k: recover AHB UserPD failures and independent reloads
++  335-wifi-ath12k-arm-UserPD-completions-before-auth.patch - wifi: ath12k: harden AHB UserPD lifecycle handshakes
++
++Previous merged from (330-ath12k-ahb-userpd-recovery.patch):
+   330-ath12k-handle-AHB-userPD-fatal-IRQ.patch
+   331-ath12k-harden-independent-UserPD-reload.patch
+ 
+-Based on work by:
+-  JiaY-shi <shi05275@163.com>
+-
+ Signed-off-by: JiaY-shi <shi05275@163.com>
+ Signed-off-by: ViKing <viking.yfy@qq.com>
+ 
+@@ -110,15 +114,65 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
+  	if (ret) {
+  		ath12k_err(ab, "Failed to load MDT segments: %d\n", ret);
+  		goto err_fw;
+-@@ -483,6 +499,7 @@ static int ath12k_ahb_power_up(struct at
++@@ -445,6 +461,17 @@ static int ath12k_ahb_power_up(struct at
++ 		goto err_fw2;
+  	}
+  
+- 	ab_ahb->rootpd_crashed = false;
+++	reinit_completion(&ab_ahb->userpd_spawned);
+++	reinit_completion(&ab_ahb->userpd_ready);
+++	reinit_completion(&ab_ahb->userpd_stopped);
+++	WRITE_ONCE(ab_ahb->userpd_spawn_acked, false);
+++	WRITE_ONCE(ab_ahb->userpd_ready_acked, false);
+++	WRITE_ONCE(ab_ahb->userpd_stop_acked, false);
+++
+++	/* Start a new UserPD boot epoch after all stale completions are gone. */
+++	WRITE_ONCE(ab_ahb->rootpd_crashed, false);
+ +	atomic_set(&ab_ahb->userpd_crashed, 0);
+++
++ 	if (ab_ahb->scm_auth_enabled) {
++ 		/* Authenticate FW image using peripheral ID */
++ 		ret = qcom_scm_pas_auth_and_reset(pasid);
++@@ -454,9 +481,6 @@ static int ath12k_ahb_power_up(struct at
++ 		}
++ 	}
++ 
++-	reinit_completion(&ab_ahb->userpd_spawned);
++-	reinit_completion(&ab_ahb->userpd_ready);
++-
++ 	/* Instruct Q6 to spawn userPD thread */
++ 	ret = qcom_smem_state_update_bits(ab_ahb->spawn_state, BIT(ab_ahb->spawn_bit),
++ 					  BIT(ab_ahb->spawn_bit));
++@@ -473,6 +497,13 @@ static int ath12k_ahb_power_up(struct at
++ 		ret = -ETIMEDOUT;
++ 		goto err_fw2;
++ 	}
+++	if (!READ_ONCE(ab_ahb->userpd_spawn_acked) ||
+++	    atomic_read(&ab_ahb->userpd_crashed) ||
+++	    READ_ONCE(ab_ahb->rootpd_crashed)) {
+++		ath12k_err(ab, "UserPD spawn interrupted by remoteproc crash\n");
+++		ret = -EIO;
+++		goto err_fw2;
+++	}
++ 
++ 	time_left = wait_for_completion_timeout(&ab_ahb->userpd_ready,
++ 						ATH12K_USERPD_READY_TIMEOUT);
++@@ -481,8 +512,14 @@ static int ath12k_ahb_power_up(struct at
++ 		ret = -ETIMEDOUT;
++ 		goto err_fw2;
++ 	}
+++	if (!READ_ONCE(ab_ahb->userpd_ready_acked) ||
+++	    atomic_read(&ab_ahb->userpd_crashed) ||
+++	    READ_ONCE(ab_ahb->rootpd_crashed)) {
+++		ath12k_err(ab, "UserPD ready interrupted by remoteproc crash\n");
+++		ret = -EIO;
+++		goto err_fw2;
+++	}
++ 
++-	ab_ahb->rootpd_crashed = false;
+  	ath12k_dbg(ab, ATH12K_DBG_AHB, "UserPD%d is now UP\n", ab_ahb->userpd_id);
+  
+  err_fw2:
+-@@ -492,6 +509,15 @@ err_fw2:
++@@ -492,6 +529,15 @@ err_fw2:
+  	release_firmware(fw2);
+  err_fw:
+  	release_firmware(fw);
+@@ -134,8 +188,12 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
+  	return ret;
+  }
+  
+-@@ -505,15 +531,18 @@ static void ath12k_ahb_power_down(struct
+- 	if (ab_ahb->rootpd_crashed)
++@@ -502,21 +548,37 @@ static void ath12k_ahb_power_down(struct
++ 	u32 pasid;
++ 	int ret;
++ 
++-	if (ab_ahb->rootpd_crashed)
+++	if (READ_ONCE(ab_ahb->rootpd_crashed))
+  		return;
+  
+ -	reinit_completion(&ab_ahb->userpd_stopped);
+@@ -149,20 +207,37 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
+ -		return;
+ +	if (!atomic_read(&ab_ahb->userpd_crashed)) {
+ +		reinit_completion(&ab_ahb->userpd_stopped);
+-+		qcom_smem_state_update_bits(ab_ahb->stop_state,
+-+					    BIT(ab_ahb->stop_bit),
+-+					    BIT(ab_ahb->stop_bit));
+-+
+-+		time_left = wait_for_completion_timeout(&ab_ahb->userpd_stopped,
+-+							ATH12K_USERPD_STOP_TIMEOUT);
+-+		if (!time_left) {
+-+			ath12k_err(ab, "UserPD stop wait timed out\n");
+-+			return;
+++		WRITE_ONCE(ab_ahb->userpd_stop_acked, false);
+++		ret = qcom_smem_state_update_bits(ab_ahb->stop_state,
+++						  BIT(ab_ahb->stop_bit),
+++						  BIT(ab_ahb->stop_bit));
+++		if (ret) {
+++			ath12k_err(ab, "failed to request UserPD stop: %d\n", ret);
+++		} else {
+++			time_left = wait_for_completion_timeout(
+++				&ab_ahb->userpd_stopped,
+++				ATH12K_USERPD_STOP_TIMEOUT);
+++			if (!time_left)
+++				ath12k_err(ab, "UserPD stop wait timed out\n");
+++			else if (!READ_ONCE(ab_ahb->userpd_stop_acked))
+++				ath12k_err(ab,
+++					   "UserPD stop interrupted by remoteproc crash\n");
+ +		}
+  	}
+  
+- 	qcom_smem_state_update_bits(ab_ahb->stop_state, BIT(ab_ahb->stop_bit), 0);
+-@@ -754,6 +783,38 @@ static const struct ath12k_hif_ops ath12
++-	qcom_smem_state_update_bits(ab_ahb->stop_state, BIT(ab_ahb->stop_bit), 0);
+++	ret = qcom_smem_state_update_bits(ab_ahb->stop_state,
+++					  BIT(ab_ahb->stop_bit), 0);
+++	if (ret)
+++		ath12k_warn(ab, "failed to clear UserPD stop request: %d\n", ret);
+++
+++	/* The RootPD crash notifier has already released this UserPD. */
+++	if (READ_ONCE(ab_ahb->rootpd_crashed))
+++		return;
++ 
++ 	if (ab_ahb->scm_auth_enabled) {
++ 		pasid = (u32_encode_bits(ab_ahb->userpd_id, ATH12K_USERPD_ID_MASK)) |
++@@ -754,17 +816,52 @@ static const struct ath12k_hif_ops ath12
+  	.power_down = ath12k_ahb_power_down,
+  };
+  
+@@ -184,10 +259,6 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
+ +{
+ +	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
+ +
+-+	if (!test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags) ||
+-+	    test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))
+-+		return;
+-+
+ +	if (atomic_cmpxchg(&ab_ahb->userpd_crashed, 0, 1))
+ +		return;
+ +
+@@ -195,21 +266,52 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
+ +	complete_all(&ab_ahb->userpd_ready);
+ +	complete_all(&ab_ahb->userpd_stopped);
+ +	ath12k_ahb_log_userpd_crash_reason(ab);
+-+	ath12k_ahb_queue_group_recovery(ab);
+++	if (test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags) &&
+++	    !test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))
+++		ath12k_ahb_queue_group_recovery(ab);
+ +}
+ +
+  static irqreturn_t ath12k_userpd_irq_handler(int irq, void *data)
+  {
+  	struct ath12k_base *ab = data;
+-@@ -765,6 +826,8 @@ static irqreturn_t ath12k_userpd_irq_han
++ 	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++ 
++ 	if (irq == ab_ahb->userpd_irq_num[ATH12K_USERPD_SPAWN_IRQ]) {
+++		WRITE_ONCE(ab_ahb->userpd_spawn_acked, true);
++ 		complete(&ab_ahb->userpd_spawned);
++ 	} else if (irq == ab_ahb->userpd_irq_num[ATH12K_USERPD_READY_IRQ]) {
+++		WRITE_ONCE(ab_ahb->userpd_ready_acked, true);
+  		complete(&ab_ahb->userpd_ready);
+  	} else if (irq == ab_ahb->userpd_irq_num[ATH12K_USERPD_STOP_ACK_IRQ])	{
+++		WRITE_ONCE(ab_ahb->userpd_stop_acked, true);
+  		complete(&ab_ahb->userpd_stopped);
+ +	} else if (irq == ab_ahb->userpd_irq_num[ATH12K_USERPD_FATAL_IRQ]) {
+ +		ath12k_ahb_handle_userpd_crash(ab);
+  	} else {
+  		ath12k_err(ab, "Invalid userpd interrupt\n");
+  		return IRQ_NONE;
++@@ -877,15 +974,19 @@ static int ath12k_ahb_root_pd_state_noti
++ 	case QCOM_SSR_AFTER_POWERUP:
++ 		ath12k_dbg(ab, ATH12K_DBG_AHB, "Root PD is UP\n");
++ 		complete(&ab_ahb->rootpd_ready);
++-		if (ab_ahb->rootpd_crashed)
+++		if (READ_ONCE(ab_ahb->rootpd_crashed))
++ 			ath12k_ahb_queue_group_recovery(ab);
++ 		return NOTIFY_OK;
++ 	case QCOM_SSR_BEFORE_SHUTDOWN:
++ 		if (!notify_data || !notify_data->crashed)
++ 			return NOTIFY_DONE;
++ 
+++		atomic_set(&ab_ahb->userpd_crashed, 1);
+++		complete_all(&ab_ahb->userpd_spawned);
+++		complete_all(&ab_ahb->userpd_ready);
+++		complete_all(&ab_ahb->userpd_stopped);
++ 		reinit_completion(&ab_ahb->rootpd_ready);
++-		ab_ahb->rootpd_crashed = true;
+++		WRITE_ONCE(ab_ahb->rootpd_crashed, true);
++ 
++ 		if (test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags) &&
++ 		    !test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags)) {
+ --- a/drivers/net/wireless/ath/ath12k/ahb.h
+ +++ b/drivers/net/wireless/ath/ath12k/ahb.h
+ @@ -39,6 +39,7 @@ enum ath12k_ahb_userpd_irq {
+@@ -230,10 +332,13 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
+  	struct completion rootpd_ready;
+  	struct notifier_block root_pd_nb;
+  	void *root_pd_notifier;
+-@@ -70,6 +74,7 @@ struct ath12k_ahb {
++@@ -70,6 +74,10 @@ struct ath12k_ahb {
+  	const struct ath12k_ahb_device_family_ops *device_family_ops;
+  	bool scm_auth_enabled;
+  	bool rootpd_crashed;
+++	bool userpd_spawn_acked;
+++	bool userpd_ready_acked;
+++	bool userpd_stop_acked;
+ +	atomic_t userpd_crashed;
+  };
+  
+diff --git a/package/kernel/mac80211/patches-qualcommbe/ath12k/335-wifi-ath12k-arm-UserPD-completions-before-auth.patch b/package/kernel/mac80211/patches-qualcommbe/ath12k/335-wifi-ath12k-arm-UserPD-completions-before-auth.patch
+deleted file mode 100644
+index 88908213a..000000000
+--- a/package/kernel/mac80211/patches-qualcommbe/ath12k/335-wifi-ath12k-arm-UserPD-completions-before-auth.patch
++++ /dev/null
+@@ -1,204 +0,0 @@
+-From: JiaY-shi <shi05275@163.com>
+-Date: Thu, 27 Aug 2026 11:40:00 +0800
+-Subject: [PATCH] wifi: ath12k: harden AHB UserPD lifecycle handshakes
+-
+-The standalone AHB UserPD loader currently authenticates and resets the
+-image before reinitializing the spawn and ready completions.  An IRQ that
+-arrives between those operations is discarded by reinit_completion(),
+-which can turn a successful UserPD transition into a timeout.
+-
+-There is also no way to distinguish a real spawn, ready, or stop ACK from
+-complete_all() used by the fatal path to unblock an in-flight operation.
+-Consequently a UserPD or RootPD crash during power up can be reported as a
+-successful boot and clear the crash state.  This is the same problem fixed
+-for Qualcomm's multi-PD remoteproc implementation by tracking an ACK beside
+-each completion.
+-
+-Arm the completions before PAS authentication, track the three UserPD ACKs,
+-and reject completions caused by either crash path.  Always clear a raised
+-stop request and continue with PAS shutdown after a missing stop ACK so a
+-failed shutdown cannot poison the next recovery attempt.  RootPD crashes
+-also wake all UserPD waiters even when the per-UserPD fatal IRQ is absent.
+-
+-Signed-off-by: JiaY-shi <shi05275@163.com>
+----
+---- a/drivers/net/wireless/ath/ath12k/ahb.c
+-+++ b/drivers/net/wireless/ath/ath12k/ahb.c
+-@@ -461,6 +461,17 @@ static int ath12k_ahb_power_up(struct at
+- 		goto err_fw2;
+- 	}
+- 
+-+	reinit_completion(&ab_ahb->userpd_spawned);
+-+	reinit_completion(&ab_ahb->userpd_ready);
+-+	reinit_completion(&ab_ahb->userpd_stopped);
+-+	WRITE_ONCE(ab_ahb->userpd_spawn_acked, false);
+-+	WRITE_ONCE(ab_ahb->userpd_ready_acked, false);
+-+	WRITE_ONCE(ab_ahb->userpd_stop_acked, false);
+-+
+-+	/* Start a new UserPD boot epoch after all stale completions are gone. */
+-+	WRITE_ONCE(ab_ahb->rootpd_crashed, false);
+-+	atomic_set(&ab_ahb->userpd_crashed, 0);
+-+
+- 	if (ab_ahb->scm_auth_enabled) {
+- 		/* Authenticate FW image using peripheral ID */
+- 		ret = qcom_scm_pas_auth_and_reset(pasid);
+-@@ -470,9 +481,6 @@ static int ath12k_ahb_power_up(struct at
+- 		}
+- 	}
+- 
+--	reinit_completion(&ab_ahb->userpd_spawned);
+--	reinit_completion(&ab_ahb->userpd_ready);
+--
+- 	/* Instruct Q6 to spawn userPD thread */
+- 	ret = qcom_smem_state_update_bits(ab_ahb->spawn_state, BIT(ab_ahb->spawn_bit),
+- 					  BIT(ab_ahb->spawn_bit));
+-@@ -489,6 +497,13 @@ static int ath12k_ahb_power_up(struct at
+- 		ret = -ETIMEDOUT;
+- 		goto err_fw2;
+- 	}
+-+	if (!READ_ONCE(ab_ahb->userpd_spawn_acked) ||
+-+	    atomic_read(&ab_ahb->userpd_crashed) ||
+-+	    READ_ONCE(ab_ahb->rootpd_crashed)) {
+-+		ath12k_err(ab, "UserPD spawn interrupted by remoteproc crash\n");
+-+		ret = -EIO;
+-+		goto err_fw2;
+-+	}
+- 
+- 	time_left = wait_for_completion_timeout(&ab_ahb->userpd_ready,
+- 						ATH12K_USERPD_READY_TIMEOUT);
+-@@ -497,9 +512,14 @@ static int ath12k_ahb_power_up(struct at
+- 		ret = -ETIMEDOUT;
+- 		goto err_fw2;
+- 	}
+-+	if (!READ_ONCE(ab_ahb->userpd_ready_acked) ||
+-+	    atomic_read(&ab_ahb->userpd_crashed) ||
+-+	    READ_ONCE(ab_ahb->rootpd_crashed)) {
+-+		ath12k_err(ab, "UserPD ready interrupted by remoteproc crash\n");
+-+		ret = -EIO;
+-+		goto err_fw2;
+-+	}
+- 
+--	ab_ahb->rootpd_crashed = false;
+--	atomic_set(&ab_ahb->userpd_crashed, 0);
+- 	ath12k_dbg(ab, ATH12K_DBG_AHB, "UserPD%d is now UP\n", ab_ahb->userpd_id);
+- 
+- err_fw2:
+-@@ -528,24 +548,37 @@ static void ath12k_ahb_power_down(struct
+- 	u32 pasid;
+- 	int ret;
+- 
+--	if (ab_ahb->rootpd_crashed)
+-+	if (READ_ONCE(ab_ahb->rootpd_crashed))
+- 		return;
+- 
+- 	if (!atomic_read(&ab_ahb->userpd_crashed)) {
+- 		reinit_completion(&ab_ahb->userpd_stopped);
+--		qcom_smem_state_update_bits(ab_ahb->stop_state,
+--					    BIT(ab_ahb->stop_bit),
+--					    BIT(ab_ahb->stop_bit));
+--
+--		time_left = wait_for_completion_timeout(&ab_ahb->userpd_stopped,
+--							ATH12K_USERPD_STOP_TIMEOUT);
+--		if (!time_left) {
+--			ath12k_err(ab, "UserPD stop wait timed out\n");
+--			return;
+-+		WRITE_ONCE(ab_ahb->userpd_stop_acked, false);
+-+		ret = qcom_smem_state_update_bits(ab_ahb->stop_state,
+-+						  BIT(ab_ahb->stop_bit),
+-+						  BIT(ab_ahb->stop_bit));
+-+		if (ret) {
+-+			ath12k_err(ab, "failed to request UserPD stop: %d\n", ret);
+-+		} else {
+-+			time_left = wait_for_completion_timeout(
+-+				&ab_ahb->userpd_stopped,
+-+				ATH12K_USERPD_STOP_TIMEOUT);
+-+			if (!time_left)
+-+				ath12k_err(ab, "UserPD stop wait timed out\n");
+-+			else if (!READ_ONCE(ab_ahb->userpd_stop_acked))
+-+				ath12k_err(ab,
+-+					   "UserPD stop interrupted by remoteproc crash\n");
+- 		}
+- 	}
+- 
+--	qcom_smem_state_update_bits(ab_ahb->stop_state, BIT(ab_ahb->stop_bit), 0);
+-+	ret = qcom_smem_state_update_bits(ab_ahb->stop_state,
+-+					  BIT(ab_ahb->stop_bit), 0);
+-+	if (ret)
+-+		ath12k_warn(ab, "failed to clear UserPD stop request: %d\n", ret);
+-+
+-+	/* The RootPD crash notifier has already released this UserPD. */
+-+	if (READ_ONCE(ab_ahb->rootpd_crashed))
+-+		return;
+- 
+- 	if (ab_ahb->scm_auth_enabled) {
+- 		pasid = (u32_encode_bits(ab_ahb->userpd_id, ATH12K_USERPD_ID_MASK)) |
+-@@ -801,10 +834,6 @@ static void ath12k_ahb_handle_userpd_cra
+- {
+- 	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
+- 
+--	if (!test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags) ||
+--	    test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))
+--		return;
+--
+- 	if (atomic_cmpxchg(&ab_ahb->userpd_crashed, 0, 1))
+- 		return;
+- 
+-@@ -812,7 +841,9 @@ static void ath12k_ahb_handle_userpd_cra
+- 	complete_all(&ab_ahb->userpd_ready);
+- 	complete_all(&ab_ahb->userpd_stopped);
+- 	ath12k_ahb_log_userpd_crash_reason(ab);
+--	ath12k_ahb_queue_group_recovery(ab);
+-+	if (test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags) &&
+-+	    !test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))
+-+		ath12k_ahb_queue_group_recovery(ab);
+- }
+- 
+- static irqreturn_t ath12k_userpd_irq_handler(int irq, void *data)
+-@@ -821,10 +852,13 @@ static irqreturn_t ath12k_userpd_irq_han
+- 	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
+- 
+- 	if (irq == ab_ahb->userpd_irq_num[ATH12K_USERPD_SPAWN_IRQ]) {
+-+		WRITE_ONCE(ab_ahb->userpd_spawn_acked, true);
+- 		complete(&ab_ahb->userpd_spawned);
+- 	} else if (irq == ab_ahb->userpd_irq_num[ATH12K_USERPD_READY_IRQ]) {
+-+		WRITE_ONCE(ab_ahb->userpd_ready_acked, true);
+- 		complete(&ab_ahb->userpd_ready);
+- 	} else if (irq == ab_ahb->userpd_irq_num[ATH12K_USERPD_STOP_ACK_IRQ])	{
+-+		WRITE_ONCE(ab_ahb->userpd_stop_acked, true);
+- 		complete(&ab_ahb->userpd_stopped);
+- 	} else if (irq == ab_ahb->userpd_irq_num[ATH12K_USERPD_FATAL_IRQ]) {
+- 		ath12k_ahb_handle_userpd_crash(ab);
+-@@ -940,15 +974,19 @@ static int ath12k_ahb_root_pd_state_noti
+- 	case QCOM_SSR_AFTER_POWERUP:
+- 		ath12k_dbg(ab, ATH12K_DBG_AHB, "Root PD is UP\n");
+- 		complete(&ab_ahb->rootpd_ready);
+--		if (ab_ahb->rootpd_crashed)
+-+		if (READ_ONCE(ab_ahb->rootpd_crashed))
+- 			ath12k_ahb_queue_group_recovery(ab);
+- 		return NOTIFY_OK;
+- 	case QCOM_SSR_BEFORE_SHUTDOWN:
+- 		if (!notify_data || !notify_data->crashed)
+- 			return NOTIFY_DONE;
+- 
+-+		atomic_set(&ab_ahb->userpd_crashed, 1);
+-+		complete_all(&ab_ahb->userpd_spawned);
+-+		complete_all(&ab_ahb->userpd_ready);
+-+		complete_all(&ab_ahb->userpd_stopped);
+- 		reinit_completion(&ab_ahb->rootpd_ready);
+--		ab_ahb->rootpd_crashed = true;
+-+		WRITE_ONCE(ab_ahb->rootpd_crashed, true);
+- 
+- 		if (test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags) &&
+- 		    !test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags)) {
+---- a/drivers/net/wireless/ath/ath12k/ahb.h
+-+++ b/drivers/net/wireless/ath/ath12k/ahb.h
+-@@ -74,6 +74,9 @@ struct ath12k_ahb {
+- 	const struct ath12k_ahb_device_family_ops *device_family_ops;
+- 	bool scm_auth_enabled;
+- 	bool rootpd_crashed;
+-+	bool userpd_spawn_acked;
+-+	bool userpd_ready_acked;
+-+	bool userpd_stop_acked;
+- 	atomic_t userpd_crashed;
+- };
+- 
+diff --git a/package/kernel/mac80211/patches-qualcommbe/ath12k/338-ath12k-low-memory-host-resources.patch b/package/kernel/mac80211/patches-qualcommbe/ath12k/338-ath12k-low-memory-host-resources.patch
+deleted file mode 100644
+index 4b242e486..000000000
+--- a/package/kernel/mac80211/patches-qualcommbe/ath12k/338-ath12k-low-memory-host-resources.patch
++++ /dev/null
+@@ -1,627 +0,0 @@
+-From: ViKing <viking.yfy@qq.com>
+-Date: Tue, 27 Oct 2026 09:40:00 +0800
+-Subject: [PATCH] wifi: ath12k: allocate and release low-memory host resources
+-
+-Consolidate consecutive changes within this functional responsibility.
+-Retain the final implementation and its error handling directly.
+-
+-Merged from:
+-  338-ath12k-allow-low-memory-host-datapath.patch
+-  339-ath12k-fix-fixed-memory-request-lifetime.patch
+-  340-ath12k-bound-low-memory-rx-buffer-allocation.patch
+-
+-Signed-off-by: ViKing <viking.yfy@qq.com>
+-
+---- a/drivers/net/wireless/ath/ath12k/ce.c
+-+++ b/drivers/net/wireless/ath/ath12k/ce.c
+-@@ -69,7 +69,7 @@ static int ath12k_ce_rx_post_pipe(struct
+- 
+- 	spin_lock_bh(&ab->ce.ce_lock);
+- 	while (pipe->rx_buf_needed) {
+--		skb = dev_alloc_skb(pipe->buf_sz);
+-+		skb = ath12k_alloc_rx_skb(ab, pipe->buf_sz);
+- 		if (!skb) {
+- 			ret = -ENOMEM;
+- 			goto exit;
+---- a/drivers/net/wireless/ath/ath12k/core.c
+-+++ b/drivers/net/wireless/ath/ath12k/core.c
+-@@ -47,6 +47,7 @@ ath12k_mem_profile_based_param ath12k_me
+- 		.max_client_dbs = 128,
+- 		.max_client_dbs_sbs = 128,
+- 		.dp_params = {
+-+			.rx_buf_ring_size = 4096,
+- 			.tx_comp_ring_size = 32768,
+- 			.rxdma_monitor_buf_ring_size = 4096,
+- 			.rxdma_monitor_dst_ring_size = 8192,
+-@@ -61,6 +62,7 @@ ath12k_mem_profile_based_param ath12k_me
+- 		.max_client_dbs = 64,
+- 		.max_client_dbs_sbs = 64,
+- 		.dp_params = {
+-+			.rx_buf_ring_size = 4096,
+- 			.tx_comp_ring_size = 16384,
+- 			.rxdma_monitor_buf_ring_size = 256,
+- 			.rxdma_monitor_dst_ring_size = 512,
+-@@ -1839,6 +1841,22 @@ int ath12k_core_pre_init(struct ath12k_b
+- 	const struct ath12k_mem_profile_based_param *param;
+- 
+- 	param = &ath12k_mem_profile_based_param[ab->target_mem_mode];
+-+	/* An integrated radio can have a fixed default-mode firmware layout
+-+	 * while sharing a small host with a discrete radio. Only reduce host
+-+	 * rings and descriptor pools; leave QMI and WMI capacity unchanged.
+-+	 */
+-+	if (of_property_read_bool(ab->dev->of_node,
+-+				  "qcom,ath12k-low-memory")) {
+-+		ab->host_profile_param = *param;
+-+		ab->host_profile_param.dp_params =
+-+			ath12k_mem_profile_based_param[ATH12K_QMI_MEMORY_MODE_LOW_512_M].dp_params;
+-+		/* RX DMA rings are configured to the host-selected size through
+-+		 * HTT. Leave firmware peer capacity and reserved DDR unchanged.
+-+		 */
+-+		ab->host_profile_param.dp_params.rx_buf_ring_size = 2048;
+-+		ab->low_memory_rx = true;
+-+		param = &ab->host_profile_param;
+-+	}
+- 	ab->profile_param = param;
+- 	ath12k_fw_map(ab);
+- 
+---- a/drivers/net/wireless/ath/ath12k/core.h
+-+++ b/drivers/net/wireless/ath/ath12k/core.h
+-@@ -945,6 +945,7 @@ struct ath12k_wsi_info {
+- };
+- 
+- struct ath12k_dp_profile_params {
+-+	u32 rx_buf_ring_size;
+- 	u32 tx_comp_ring_size;
+- 	u32 rxdma_monitor_buf_ring_size;
+- 	u32 rxdma_monitor_dst_ring_size;
+-@@ -1170,6 +1171,8 @@ struct ath12k_base {
+- 	struct ath12k_reg_freq reg_freq_5ghz;
+- 	struct ath12k_reg_freq reg_freq_6ghz;
+- 	const struct ath12k_mem_profile_based_param *profile_param;
+-+	struct ath12k_mem_profile_based_param host_profile_param;
+-+	bool low_memory_rx;
+- 	enum ath12k_qmi_mem_mode target_mem_mode;
+- 
+- 	/* FIXME: Define this field in a ag equivalent object available
+-@@ -1280,6 +1283,20 @@ struct ath12k_fw_stats_pdev {
+- 	s32 mpdu_errs;
+- };
+- 
+-+static inline struct sk_buff *ath12k_alloc_rx_skb(struct ath12k_base *ab,
+-+					       unsigned int len)
+-+{
+-+	struct sk_buff *skb;
+-+
+-+	if (!ab->low_memory_rx)
+-+		return dev_alloc_skb(len);
+-+
+-+	skb = alloc_skb(len + NET_SKB_PAD, GFP_ATOMIC);
+-+	if (skb)
+-+		skb_reserve(skb, NET_SKB_PAD);
+-+	return skb;
+-+}
+-+
+- int ath12k_core_qmi_firmware_ready(struct ath12k_base *ab);
+- void ath12k_core_hw_group_cleanup(struct ath12k_hw_group *ag);
+- int ath12k_core_pre_init(struct ath12k_base *ab);
+---- a/drivers/net/wireless/ath/ath12k/debugfs.c
+-+++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+-@@ -4,6 +4,8 @@
+-  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+-  */
+- 
+-+#include <linux/seq_file.h>
+-+
+- #include "core.h"
+- #include "dp_tx.h"
+- #include "debug.h"
+-@@ -1212,13 +1214,28 @@ static const struct file_operations fops
+- 	.llseek = default_llseek,
+- };
+- 
+-+static void ath12k_debugfs_create_base_file(struct ath12k_base *ab,
+-+					   const char *name, umode_t mode,
+-+					   const struct file_operations *fops)
+-+{
+-+	struct dentry *existing;
+-+
+-+	/* SoC files outlive a firmware recovery and keep the same base owner. */
+-+	existing = debugfs_lookup(name, ab->debugfs_soc);
+-+	if (existing) {
+-+		dput(existing);
+-+		return;
+-+	}
+-+
+-+	debugfs_create_file(name, mode, ab->debugfs_soc, ab, fops);
+-+}
+-+
+- void ath12k_debugfs_pdev_create(struct ath12k_base *ab)
+- {
+--	debugfs_create_file("simulate_fw_crash", 0600, ab->debugfs_soc, ab,
+--			    &fops_simulate_fw_crash);
+--
+--	debugfs_create_file("device_dp_stats", 0400, ab->debugfs_soc, ab,
+--			    &fops_device_dp_stats);
+-+	ath12k_debugfs_create_base_file(ab, "simulate_fw_crash", 0600,
+-+				       &fops_simulate_fw_crash);
+-+	ath12k_debugfs_create_base_file(ab, "device_dp_stats", 0400,
+-+				       &fops_device_dp_stats);
+- }
+- 
+- void ath12k_debugfs_soc_create(struct ath12k_base *ab)
+---- a/drivers/net/wireless/ath/ath12k/dp_mon.c
+-+++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+-@@ -44,15 +44,15 @@ struct sk_buff
+- 	struct sk_buff *skb;
+- 	dma_addr_t paddr;
+- 
+--	skb = dev_alloc_skb(RX_MON_STATUS_BUF_SIZE);
+-+	skb = ath12k_alloc_rx_skb(ab, RX_MON_STATUS_BUF_SIZE);
+- 
+- 	if (!skb)
+- 		goto fail_alloc_skb;
+- 
+- 	if (!IS_ALIGNED((unsigned long)skb->data,
+- 			RX_MON_STATUS_BUF_ALIGN)) {
+--		skb_pull(skb, PTR_ALIGN(skb->data, RX_MON_STATUS_BUF_ALIGN) -
+--			 skb->data);
+-+		skb_reserve(skb, PTR_ALIGN(skb->data, RX_MON_STATUS_BUF_ALIGN) -
+-+			    skb->data);
+- 	}
+- 
+- 	paddr = dma_map_single(ab->dev, skb->data,
+-@@ -601,14 +601,14 @@ int ath12k_dp_mon_buf_replenish(struct a
+- 	ath12k_hal_srng_access_begin(ab, srng);
+- 
+- 	while (req_entries > 0) {
+--		skb = dev_alloc_skb(DP_RX_BUFFER_SIZE + DP_RX_BUFFER_ALIGN_SIZE);
+-+		skb = ath12k_alloc_rx_skb(ab, DP_RX_BUFFER_SIZE + DP_RX_BUFFER_ALIGN_SIZE);
+- 		if (unlikely(!skb))
+- 			goto fail_alloc_skb;
+- 
+- 		if (!IS_ALIGNED((unsigned long)skb->data, DP_RX_BUFFER_ALIGN_SIZE)) {
+--			skb_pull(skb,
+--				 PTR_ALIGN(skb->data, DP_RX_BUFFER_ALIGN_SIZE) -
+--				 skb->data);
+-+			skb_reserve(skb,
+-+				    PTR_ALIGN(skb->data, DP_RX_BUFFER_ALIGN_SIZE) -
+-+				    skb->data);
+- 		}
+- 
+- 		paddr = dma_map_single(ab->dev, skb->data,
+-@@ -690,15 +690,15 @@ int ath12k_dp_mon_status_bufs_replenish(
+- 	num_remain = req_entries;
+- 
+- 	while (num_remain > 0) {
+--		skb = dev_alloc_skb(RX_MON_STATUS_BUF_SIZE);
+-+		skb = ath12k_alloc_rx_skb(ab, RX_MON_STATUS_BUF_SIZE);
+- 		if (!skb)
+- 			break;
+- 
+- 		if (!IS_ALIGNED((unsigned long)skb->data,
+- 				RX_MON_STATUS_BUF_ALIGN)) {
+--			skb_pull(skb,
+--				 PTR_ALIGN(skb->data, RX_MON_STATUS_BUF_ALIGN) -
+--				 skb->data);
+-+			skb_reserve(skb,
+-+				    PTR_ALIGN(skb->data, RX_MON_STATUS_BUF_ALIGN) -
+-+				    skb->data);
+- 		}
+- 
+- 		paddr = dma_map_single(ab->dev, skb->data,
+---- a/drivers/net/wireless/ath/ath12k/dp_rx.c
+-+++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+-@@ -114,15 +114,15 @@ int ath12k_dp_rx_bufs_replenish(struct a
+- 	}
+- 
+- 	while (num_remain > 0) {
+--		skb = dev_alloc_skb(DP_RX_BUFFER_SIZE +
+-+		skb = ath12k_alloc_rx_skb(ab, DP_RX_BUFFER_SIZE +
+- 				    DP_RX_BUFFER_ALIGN_SIZE);
+- 		if (!skb)
+- 			break;
+- 
+- 		if (!IS_ALIGNED((unsigned long)skb->data,
+- 				DP_RX_BUFFER_ALIGN_SIZE)) {
+--			skb_pull(skb,
+--				 PTR_ALIGN(skb->data, DP_RX_BUFFER_ALIGN_SIZE) -
+-+			skb_reserve(skb,
+-+				    PTR_ALIGN(skb->data, DP_RX_BUFFER_ALIGN_SIZE) -
+- 				 skb->data);
+- 		}
+- 
+-@@ -138,13 +138,13 @@ int ath12k_dp_rx_bufs_replenish(struct a
+- 		if (!rx_desc)
+- 			goto fail_dma_unmap;
+- 
+--		rx_desc->skb = skb;
+- 		cookie = rx_desc->cookie;
+- 
+- 		desc = ath12k_hal_srng_src_get_next_entry(ab, srng);
+- 		if (!desc)
+- 			goto fail_dma_unmap;
+- 
+-+		rx_desc->skb = skb;
+- 		list_del(&rx_desc->list);
+- 		ATH12K_SKB_RXCB(skb)->paddr = paddr;
+- 
+-@@ -1702,7 +1702,7 @@ int ath12k_dp_rx_alloc(struct ath12k_bas
+- 	ret = ath12k_dp_srng_setup(ab,
+- 				   &dp->rx_refill_buf_ring.refill_buf_ring,
+- 				   HAL_RXDMA_BUF, 0, 0,
+--				   DP_RXDMA_BUF_RING_SIZE);
+-+				   ab->profile_param->dp_params.rx_buf_ring_size);
+- 	if (ret) {
+- 		ath12k_warn(ab, "failed to setup rx_refill_buf_ring\n");
+- 		return ret;
+---- a/drivers/net/wireless/ath/ath12k/qmi.c
+-+++ b/drivers/net/wireless/ath/ath12k/qmi.c
+-@@ -2721,11 +2721,82 @@ clear_chunk:
+- 	chunk->size = 0;
+- }
+- 
+-+static void ath12k_qmi_unmap_fixed_mem(struct ath12k_base *ab,
+-+				      struct ath12k_qmi_fixed_mem *mem)
+-+{
+-+	lockdep_assert_held(&ab->ag->mutex);
+-+
+-+	if (!mem->ioaddr)
+-+		return;
+-+
+-+	iounmap(mem->ioaddr);
+-+
+-+	memset(mem, 0, sizeof(*mem));
+-+}
+-+
+-+static void ath12k_qmi_begin_fixed_request(struct ath12k_base *ab)
+-+{
+-+	int i;
+-+
+-+	lockdep_assert_held(&ab->ag->mutex);
+-+
+-+	for (i = 0; i < ARRAY_SIZE(ab->qmi.fixed_mem); i++)
+-+		ab->qmi.fixed_mem[i].used = false;
+-+}
+-+
+-+static void ath12k_qmi_prune_fixed_mem(struct ath12k_base *ab)
+-+{
+-+	int i;
+-+
+-+	for (i = 0; i < ARRAY_SIZE(ab->qmi.fixed_mem); i++) {
+-+		if (!ab->qmi.fixed_mem[i].used)
+-+			ath12k_qmi_unmap_fixed_mem(ab, &ab->qmi.fixed_mem[i]);
+-+	}
+-+}
+-+
+-+static int ath12k_qmi_map_fixed_mem(struct ath12k_base *ab, int idx,
+-+				   phys_addr_t paddr, u32 size, u32 type)
+-+{
+-+	struct ath12k_qmi_fixed_mem *mem = &ab->qmi.fixed_mem[idx];
+-+	struct target_mem_chunk *chunk = &ab->qmi.target_mem[idx];
+-+	void __iomem *ioaddr;
+-+
+-+	lockdep_assert_held(&ab->ag->mutex);
+-+	if (!size)
+-+		return -EINVAL;
+-+
+-+	if (!mem->ioaddr || mem->paddr != paddr || mem->size != size ||
+-+	    mem->type != type) {
+-+		/* Keep the previous owner reachable if mapping the replacement fails. */
+-+		ioaddr = ioremap(paddr, size);
+-+		if (!ioaddr)
+-+			return -EIO;
+-+
+-+		ath12k_qmi_unmap_fixed_mem(ab, mem);
+-+		mem->ioaddr = ioaddr;
+-+		mem->paddr = paddr;
+-+		mem->size = size;
+-+		mem->type = type;
+-+	}
+-+
+-+	mem->used = true;
+-+	chunk->paddr = mem->paddr;
+-+	chunk->v.ioaddr = mem->ioaddr;
+-+	chunk->size = size;
+-+	chunk->type = type;
+-+	return 0;
+-+}
+-+
+- static void ath12k_qmi_free_target_mem_chunk(struct ath12k_base *ab)
+- {
+- 	struct ath12k_hw_group *ag = ab->ag;
+-+	struct target_mem_chunk unused = {};
+- 	int i, mlo_idx;
+- 
+-+	lockdep_assert_held(&ag->mutex);
+-+	for (i = 0; i < ARRAY_SIZE(ab->qmi.fixed_mem); i++)
+-+		ath12k_qmi_unmap_fixed_mem(ab, &ab->qmi.fixed_mem[i]);
+-+
+- 	for (i = 0, mlo_idx = 0; i < ab->qmi.mem_seg_count; i++) {
+- 		if (ab->qmi.target_mem[i].type == MLO_GLOBAL_MEM_REGION_TYPE) {
+- 			if (ab->qmi.target_mem[i].paddr)
+-@@ -2734,9 +2805,7 @@ static void ath12k_qmi_free_target_mem_c
+- 							      mlo_idx);
+- 			mlo_idx++;
+- 		} else {
+--			if (test_bit(ATH12K_FLAG_FIXED_MEM_REGION, &ab->dev_flags) &&
+--			    ab->qmi.target_mem[i].v.ioaddr) {
+--				iounmap(ab->qmi.target_mem[i].v.ioaddr);
+-+			if (test_bit(ATH12K_FLAG_FIXED_MEM_REGION, &ab->dev_flags)) {
+- 				ab->qmi.target_mem[i].v.ioaddr = NULL;
+- 			} else {
+- 				if (!ab->qmi.target_mem[i].v.addr)
+-@@ -2751,6 +2820,11 @@ static void ath12k_qmi_free_target_mem_c
+- 	}
+- 
+- 	if (!ag->num_started && ag->mlo_mem.init_done) {
+-+		/* A shorter request may no longer contain an MLO view. Release by
+-+		 * group ownership, never by the new request's segment count.
+-+		 */
+-+		for (i = 0; i < ARRAY_SIZE(ag->mlo_mem.chunk); i++)
+-+			ath12k_qmi_free_mlo_mem_chunk(ab, &unused, i);
+- 		ag->mlo_mem.init_done = false;
+- 		ag->mlo_mem.mlo_mem_size = 0;
+- 		ag->mlo_mem.fixed_mem = false;
+-@@ -3014,6 +3088,7 @@ static int ath12k_qmi_assign_pci_target_
+- 		return -ENODEV;
+- 
+- 	mutex_lock(&ag->mutex);
+-+	ath12k_qmi_begin_fixed_request(ab);
+- 
+- 	if (!ag->mlo_mem.init_done) {
+- 		memset(ag->mlo_mem.chunk, 0, sizeof(ag->mlo_mem.chunk));
+-@@ -3049,12 +3124,11 @@ static int ath12k_qmi_assign_pci_target_
+- 				goto out;
+- 			}
+- 
+--			chunk->paddr = host_rmem->base + host_offset;
+--			chunk->v.ioaddr = ioremap(chunk->paddr, chunk->size);
+--			if (!chunk->v.ioaddr) {
+--				ret = -EIO;
+-+			ret = ath12k_qmi_map_fixed_mem(ab, i,
+-+						     host_rmem->base + host_offset,
+-+						     chunk->size, chunk->type);
+-+			if (ret)
+- 				goto out;
+--			}
+- 			host_offset += chunk->size;
+- 			break;
+- 		case MLO_GLOBAL_MEM_REGION_TYPE:
+-@@ -3094,13 +3168,14 @@ static int ath12k_qmi_assign_pci_target_
+- 		goto out;
+- 	}
+- 
+--	ath12k_info(ab, "using fixed PCI host DDR addr %pa size %pa used %zu\n",
+--		    &host_rmem->base, &host_rmem->size, host_offset);
+-+	ath12k_qmi_prune_fixed_mem(ab);
+-+
+- 	mutex_unlock(&ag->mutex);
+- 
+- 	return 0;
+- 
+- out:
+-+
+- 	ath12k_qmi_free_target_mem_chunk(ab);
+- 	mutex_unlock(&ag->mutex);
+- 	return ret;
+-@@ -3111,7 +3186,8 @@ static int ath12k_qmi_assign_target_mem_
+- 	struct target_mem_chunk *chunk;
+- 	struct ath12k_hw_group *ag = ab->ag;
+- 	struct reserved_mem *rmem;
+--	size_t avail_rmem_size;
+-+	u32 type, size;
+-+	const char *name;
+- 	int i, idx, mlo_idx, ret;
+- 	int mlo_size = 0;
+- 
+-@@ -3120,6 +3196,7 @@ static int ath12k_qmi_assign_target_mem_
+- 		return ath12k_qmi_assign_pci_target_mem_chunk(ab);
+- 
+- 	mutex_lock(&ag->mutex);
+-+	ath12k_qmi_begin_fixed_request(ab);
+- 
+- 	if (!ag->mlo_mem.init_done) {
+- 		memset(ag->mlo_mem.chunk, 0, sizeof(ag->mlo_mem.chunk));
+-@@ -3129,77 +3206,37 @@ static int ath12k_qmi_assign_target_mem_
+- 	}
+- 
+- 	for (i = 0, idx = 0, mlo_idx = 0; i < ab->qmi.mem_seg_count; i++) {
+--		switch (ab->qmi.target_mem[i].type) {
+-+		type = ab->qmi.target_mem[i].type;
+-+		size = ab->qmi.target_mem[i].size;
+-+		switch (type) {
+- 		case HOST_DDR_REGION_TYPE:
+--			rmem = ath12k_core_get_reserved_mem(ab, 0);
+--			if (!rmem) {
+--				ret = -ENODEV;
+--				goto out;
+--			}
+--
+--			avail_rmem_size = rmem->size;
+--			if (avail_rmem_size < ab->qmi.target_mem[i].size) {
+--				ath12k_dbg(ab, ATH12K_DBG_QMI,
+--					   "failed to assign mem type %u req size %u avail size %zu\n",
+--					   ab->qmi.target_mem[i].type,
+--					   ab->qmi.target_mem[i].size,
+--					   avail_rmem_size);
+--				ret = -EINVAL;
+--				goto out;
+--			}
+--
+--			ab->qmi.target_mem[idx].paddr = rmem->base;
+--			ab->qmi.target_mem[idx].v.ioaddr =
+--				ioremap(ab->qmi.target_mem[idx].paddr,
+--					ab->qmi.target_mem[i].size);
+--			if (!ab->qmi.target_mem[idx].v.ioaddr) {
+--				ret = -EIO;
+--				goto out;
+--			}
+--			ab->qmi.target_mem[idx].size = ab->qmi.target_mem[i].size;
+--			ab->qmi.target_mem[idx].type = ab->qmi.target_mem[i].type;
+--			idx++;
+--			break;
+- 		case BDF_MEM_REGION_TYPE:
+--			rmem = ath12k_core_get_reserved_mem(ab, 0);
+--			if (!rmem) {
+--				ret = -ENODEV;
+--				goto out;
+--			}
+--
+--			avail_rmem_size = rmem->size - ab->hw_params->bdf_addr_offset;
+--			if (avail_rmem_size < ab->qmi.target_mem[i].size) {
+--				ath12k_dbg(ab, ATH12K_DBG_QMI,
+--					   "failed to assign mem type %u req size %u avail size %zu\n",
+--					   ab->qmi.target_mem[i].type,
+--					   ab->qmi.target_mem[i].size,
+--					   avail_rmem_size);
+--				ret = -EINVAL;
+--				goto out;
+--			}
+--			ab->qmi.target_mem[idx].paddr =
+--				rmem->base + ab->hw_params->bdf_addr_offset;
+--			ab->qmi.target_mem[idx].v.ioaddr =
+--				ioremap(ab->qmi.target_mem[idx].paddr,
+--					ab->qmi.target_mem[i].size);
+--			if (!ab->qmi.target_mem[idx].v.ioaddr) {
+--				ret = -EIO;
+--				goto out;
+--			}
+--			ab->qmi.target_mem[idx].size = ab->qmi.target_mem[i].size;
+--			ab->qmi.target_mem[idx].type = ab->qmi.target_mem[i].type;
+--			idx++;
+--			break;
+- 		case CALDB_MEM_REGION_TYPE:
+--			/* Cold boot calibration is not enabled in Ath12k. Hence,
+--			 * assign paddr = 0.
+--			 * Once cold boot calibration is enabled add support to
+--			 * assign reserved memory from DT.
+--			 */
+--			ab->qmi.target_mem[idx].paddr = 0;
+--			ab->qmi.target_mem[idx].v.ioaddr = NULL;
+--			ab->qmi.target_mem[idx].size = ab->qmi.target_mem[i].size;
+--			ab->qmi.target_mem[idx].type = ab->qmi.target_mem[i].type;
+-+		case M3_DUMP_REGION_TYPE:
+-+			name = type == CALDB_MEM_REGION_TYPE ? "q6-caldb" :
+-+			       type == M3_DUMP_REGION_TYPE ? "m3-dump" :
+-+			       "host-ddr-mem";
+-+			rmem = ath12k_core_get_rmem_by_name(ab, name);
+-+			if (!rmem && type == CALDB_MEM_REGION_TYPE) {
+-+				/* Preserve the optional CALDB zero-address contract. */
+-+				ab->qmi.target_mem[idx].paddr = 0;
+-+				ab->qmi.target_mem[idx].v.ioaddr = NULL;
+-+				ab->qmi.target_mem[idx].size = size;
+-+				ab->qmi.target_mem[idx].type = type;
+-+			} else {
+-+				if (!rmem) {
+-+					ret = -ENODEV;
+-+					goto out;
+-+				}
+-+				if (size > rmem->size) {
+-+					ret = -EINVAL;
+-+					goto out;
+-+				}
+-+				ret = ath12k_qmi_map_fixed_mem(ab, idx, rmem->base,
+-+							     size, type);
+-+				if (ret)
+-+					goto out;
+-+			}
+- 			idx++;
+- 			break;
+- 		case MLO_GLOBAL_MEM_REGION_TYPE:
+-@@ -3224,41 +3261,12 @@ static int ath12k_qmi_assign_target_mem_
+- 			idx++;
+- 			mlo_idx++;
+- 			break;
+--		case M3_DUMP_REGION_TYPE:
+--			rmem = ath12k_core_get_reserved_mem(ab, 1);
+--			if (!rmem) {
+--				ret = -EINVAL;
+--				goto out;
+--			}
+--
+--			avail_rmem_size = rmem->size;
+--			if (avail_rmem_size < ab->qmi.target_mem[i].size) {
+--				ath12k_dbg(ab, ATH12K_DBG_QMI,
+--					   "failed to assign mem type %u req size %u avail size %zu\n",
+--					   ab->qmi.target_mem[i].type,
+--					   ab->qmi.target_mem[i].size,
+--					   avail_rmem_size);
+--				ret = -EINVAL;
+--				goto out;
+--			}
+--
+--			ab->qmi.target_mem[idx].paddr = rmem->base;
+--			ab->qmi.target_mem[idx].v.ioaddr =
+--				ioremap(ab->qmi.target_mem[idx].paddr,
+--					ab->qmi.target_mem[i].size);
+--			if (!ab->qmi.target_mem[idx].v.ioaddr) {
+--				ret = -EIO;
+--				goto out;
+--			}
+--			ab->qmi.target_mem[idx].size = ab->qmi.target_mem[i].size;
+--			ab->qmi.target_mem[idx].type = ab->qmi.target_mem[i].type;
+--			idx++;
+--			break;
+- 		default:
+- 			ath12k_warn(ab, "qmi ignore invalid mem req type %u\n",
+- 				    ab->qmi.target_mem[i].type);
+- 			break;
+- 		}
+-+
+- 	}
+- 	ab->qmi.mem_seg_count = idx;
+- 
+-@@ -3272,10 +3280,12 @@ static int ath12k_qmi_assign_target_mem_
+- 		goto out;
+- 	}
+- 
+-+	ath12k_qmi_prune_fixed_mem(ab);
+- 	mutex_unlock(&ag->mutex);
+- 
+- 	return 0;
+- out:
+-+
+- 	ath12k_qmi_free_target_mem_chunk(ab);
+- 	mutex_unlock(&ag->mutex);
+- 	return ret;
+-@@ -4259,9 +4269,11 @@ static void ath12k_qmi_msg_mem_request_c
+- 	ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi firmware request memory request\n");
+- 
+- 	if (msg->mem_seg_len == 0 ||
+--	    msg->mem_seg_len > ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01)
+-+	    msg->mem_seg_len > ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01) {
+- 		ath12k_warn(ab, "Invalid memory segment length: %u\n",
+- 			    msg->mem_seg_len);
+-+		return;
+-+	}
+- 
+- 	ab->qmi.mem_seg_count = msg->mem_seg_len;
+- 
+---- a/drivers/net/wireless/ath/ath12k/qmi.h
+-+++ b/drivers/net/wireless/ath/ath12k/qmi.h
+-@@ -135,6 +135,17 @@ struct dev_mem_info {
+- 	u64 size;
+- };
+- 
+-+/* Mapping ownership is independent of the latest firmware request/views.
+-+ * All fields are protected by the hardware group mutex.
+-+ */
+-+struct ath12k_qmi_fixed_mem {
+-+	void __iomem *ioaddr;
+-+	phys_addr_t paddr;
+-+	u32 size;
+-+	u32 type;
+-+	bool used;
+-+};
+-+
+- struct ath12k_qmi {
+- 	struct ath12k_base *ab;
+- 	struct qmi_handle handle;
+-@@ -145,6 +156,7 @@ struct ath12k_qmi {
+- 	spinlock_t event_lock; /* spinlock for qmi event list */
+- 	struct ath12k_qmi_ce_cfg ce_cfg;
+- 	struct target_mem_chunk target_mem[ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01];
+-+	struct ath12k_qmi_fixed_mem fixed_mem[ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01];
+- 	u32 mem_seg_count;
+- 	u32 target_mem_mode;
+- 	bool target_mem_delayed;
+diff --git a/package/kernel/mac80211/patches-qualcommbe/ath12k/342-ath12k-support-host-ddr-view-within-wcss-memory.patch b/package/kernel/mac80211/patches-qualcommbe/ath12k/342-ath12k-support-host-ddr-view-within-wcss-memory.patch
+deleted file mode 100644
+index 9cdd40211..000000000
+--- a/package/kernel/mac80211/patches-qualcommbe/ath12k/342-ath12k-support-host-ddr-view-within-wcss-memory.patch
++++ /dev/null
+@@ -1,65 +0,0 @@
+-From: ViKing <viking.yfy@qq.com>
+-Date: Sun, 25 Oct 2026 14:06:01 +0800
+-Subject: [PATCH] wifi: ath12k: support host DDR view within WCSS memory
+-
+-An IPQ5332 UserPD host-DDR window can be contained in the root WCSS
+-carveout used by remoteproc. Declare the physical reservation once and
+-reference it for both roles, instead of creating overlapping reserved
+-memory nodes. qcom,host-ddr-offset is a local optional u32 DT extension
+-for AHB HOST_DDR and BDF mappings; zero retains the existing contract.
+-
+-Bound both the offset and requested length against the owning region
+-before mapping. CALDB, M3, MLO and fixed PCI mappings keep their existing
+-addresses. This preserves the complete remoteproc carveout and firmware
+-physical addresses while removing the duplicate reservation.
+-
+-Signed-off-by: ViKing <viking.yfy@qq.com>
+----
+---- a/drivers/net/wireless/ath/ath12k/qmi.c
+-+++ b/drivers/net/wireless/ath/ath12k/qmi.c
+-@@ -3186,7 +3186,8 @@ static int ath12k_qmi_assign_target_mem_
+- 	struct target_mem_chunk *chunk;
+- 	struct ath12k_hw_group *ag = ab->ag;
+- 	struct reserved_mem *rmem;
+--	u32 type, size;
+-+	u32 type, size, host_offset = 0;
+-+	size_t offset;
+- 	const char *name;
+- 	int i, idx, mlo_idx, ret;
+- 	int mlo_size = 0;
+-@@ -3195,6 +3196,10 @@ static int ath12k_qmi_assign_target_mem_
+- 	    test_bit(ATH12K_FLAG_FIXED_MEM_REGION, &ab->dev_flags))
+- 		return ath12k_qmi_assign_pci_target_mem_chunk(ab);
+- 
+-+	/* A host DDR view can share the remoteproc WCSS reservation. */
+-+	of_property_read_u32(ab->dev->of_node, "qcom,host-ddr-offset",
+-+			     &host_offset);
+-+
+- 	mutex_lock(&ag->mutex);
+- 	ath12k_qmi_begin_fixed_request(ab);
+- 
+-@@ -3216,6 +3221,8 @@ static int ath12k_qmi_assign_target_mem_
+- 			name = type == CALDB_MEM_REGION_TYPE ? "q6-caldb" :
+- 			       type == M3_DUMP_REGION_TYPE ? "m3-dump" :
+- 			       "host-ddr-mem";
+-+			offset = type == HOST_DDR_REGION_TYPE ||
+-+				 type == BDF_MEM_REGION_TYPE ? host_offset : 0;
+- 			rmem = ath12k_core_get_rmem_by_name(ab, name);
+- 			if (!rmem && type == CALDB_MEM_REGION_TYPE) {
+- 				/* Preserve the optional CALDB zero-address contract. */
+-@@ -3228,11 +3235,13 @@ static int ath12k_qmi_assign_target_mem_
+- 					ret = -ENODEV;
+- 					goto out;
+- 				}
+--				if (size > rmem->size) {
+-+				if (offset > rmem->size ||
+-+				    size > rmem->size - offset) {
+- 					ret = -EINVAL;
+- 					goto out;
+- 				}
+--				ret = ath12k_qmi_map_fixed_mem(ab, idx, rmem->base,
+-+				ret = ath12k_qmi_map_fixed_mem(ab, idx,
+-+							     rmem->base + offset,
+- 							     size, type);
+- 				if (ret)
+- 					goto out;

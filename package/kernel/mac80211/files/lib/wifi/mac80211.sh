@@ -352,7 +352,7 @@ mac80211_emit_detect() {
 	num_global_macaddr="$default_mac_count"
 
 	[ -n "$ssid" ] || ssid="LEDE"
-	[ -n "$country" ] || country="US"
+	[ -n "$country" ] || country="CN"
 
 	case "$band" in
 		6g)

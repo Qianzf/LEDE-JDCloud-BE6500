@@ -1,0 +1,19 @@
+diff --git a/package/firmware/ipq-wifi/Makefile b/package/firmware/ipq-wifi/Makefile
+index f6c3644dc..4b4643fac 100644
+--- a/package/firmware/ipq-wifi/Makefile
++++ b/package/firmware/ipq-wifi/Makefile
+@@ -16,6 +16,14 @@ PKG_FLAGS:=nonshared
+ 
+ include $(INCLUDE_DIR)/package.mk
+ 
++# 本地板级数据优先：把本包 files/ 目录覆盖进解包目录，
++# 用于上游 qca-wireless 仓库尚未收录的设备（如 jdcloud_re-cs-06）。
++# 已收录的设备不受影响（上游文件会被本地空目录覆盖前先拷贝，本地若有同名文件则以本地为准）。
++define Build/Prepare
++	$(call Build/Prepare/Default)
++	$(if $(wildcard $(CURDIR)/files),$(CP) -a $(CURDIR)/files/. $(PKG_BUILD_DIR)/,)
++endef
++
+ define Build/Compile
+ endef
+ 

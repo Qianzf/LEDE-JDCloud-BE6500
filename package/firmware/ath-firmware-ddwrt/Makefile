@@ -56,6 +56,13 @@ define Build/Prepare
 	$(call Build/Prepare/Default)
 	$(INSTALL_DIR) $(addprefix $(PKG_BUILD_DIR)/,$(sort $(FIRMWARE_DIRS)))
 	$(FIRMWARE_INSTALL)
+	# Local override: the upstream bundle ships IPQ5332 WLAN.WBE.1.7 while
+	# QCN9274 ships WLAN.WBE.1.6.  The two radios form one MLO/WSI group and
+	# the IPQ5332 firmware asserts at platform_mlo.c (partner_chip_crash_ind)
+	# on a version mismatch, so both chips must run the same build.
+	# files/ carries the matching WLAN.WBE.1.6 set; board-2.bin is left out
+	# because ipq-wifi provides the per-board BDF.
+	$(if $(wildcard ./files/*),$(CP) ./files/. $(PKG_BUILD_DIR)/)
 endef
 
 define Build/Compile

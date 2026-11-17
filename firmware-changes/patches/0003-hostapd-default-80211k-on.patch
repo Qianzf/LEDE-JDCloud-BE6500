@@ -1,0 +1,13 @@
+diff --git a/package/network/services/hostapd/files/hostapd.sh b/package/network/services/hostapd/files/hostapd.sh
+index 570af2c0b..ee2a1e55b 100644
+--- a/package/network/services/hostapd/files/hostapd.sh
++++ b/package/network/services/hostapd/files/hostapd.sh
+@@ -870,7 +870,7 @@ hostapd_set_bss_options() {
+ 	[ "$mbo" -eq 1 ] && append bss_conf "mbo=1" "$N"
+ 
+ 	json_get_vars ieee80211k rrm_neighbor_report rrm_beacon_report
+-	set_default ieee80211k 0
++	set_default ieee80211k 1
+ 	if [ "$ieee80211k" -eq "1" ]; then
+ 		set_default rrm_neighbor_report 1
+ 		set_default rrm_beacon_report 1
