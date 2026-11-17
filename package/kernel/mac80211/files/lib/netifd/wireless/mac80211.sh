@@ -137,7 +137,9 @@ mac80211_hostapd_setup_base() {
 
 	[ "$auto_channel" -gt 0 ] && channel=acs_survey
 
-	[ "$auto_channel" -gt 0 ] && json_get_vars acs_exclude_dfs
+	# ACS 默认排除 DFS 信道：DFS 上的 BSS 很多客户端（按国家码/被动扫描策略）
+	# 根本扫不到，表现为"部分设备搜不到 SSID"。用户可 uci 设 acs_exclude_dfs=0 关掉。
+	[ "$auto_channel" -gt 0 ] && json_get_vars acs_exclude_dfs:1
 	[ -n "$acs_exclude_dfs" ] && [ "$acs_exclude_dfs" -gt 0 ] &&
 		append base_cfg "acs_exclude_dfs=1" "$N"
 
@@ -237,6 +239,14 @@ mac80211_hostapd_setup_base() {
 	vht_oper_chwidth=0
 	vht_center_seg0=
 
+	# ACS 时 $channel 已被改写成 "acs_survey"，下面按固定信道推导中心频点的公式
+	# 会把它当成 0（0-6=-6），hostapd 因此得到 center_freq1=4970MHz，
+	# 触发 "Wrong coupling between HT and VHT/HE channel setting" 和
+	# "Failed to check if DFS is required; ret=-1"。ACS 的中心频点必须由
+	# hostapd 在选好信道之后自己算，所以这里不写 seg0。
+	is_acs=0
+	case "$channel" in acs_survey|auto) is_acs=1;; esac
+
 	idx="$channel"
 	case "$htmode" in
 		VHT20|HE20|EHT20) enable_ac=1;;
@@ -246,7 +256,7 @@ mac80211_hostapd_setup_base() {
 				0) idx=$(($channel - 2));;
 			esac
 			enable_ac=1
-			vht_center_seg0=$idx
+			[ "$is_acs" = 1 ] || vht_center_seg0=$idx
 		;;
 		VHT80|HE80|EHT80)
 			case "$(( (($channel / 4) + $chan_ofs) % 4 ))" in
@@ -257,7 +267,7 @@ mac80211_hostapd_setup_base() {
 			esac
 			enable_ac=1
 			vht_oper_chwidth=1
-			vht_center_seg0=$idx
+			[ "$is_acs" = 1 ] || vht_center_seg0=$idx
 		;;
 		VHT160|HE160|EHT160|EHT320)
 			if [ "$band" = "6g" ]; then
@@ -279,7 +289,7 @@ mac80211_hostapd_setup_base() {
 			fi
 			enable_ac=1
 			vht_oper_chwidth=2
-			vht_center_seg0=$idx
+			[ "$is_acs" = 1 ] || vht_center_seg0=$idx
 		;;
 	esac
 	[ "$band" = "5g" ] && {
@@ -344,7 +354,8 @@ mac80211_hostapd_setup_base() {
 		done
 
 		append base_cfg "vht_oper_chwidth=$vht_oper_chwidth" "$N"
-		append base_cfg "vht_oper_centr_freq_seg0_idx=$vht_center_seg0" "$N"
+		[ -n "$vht_center_seg0" ] &&
+			append base_cfg "vht_oper_centr_freq_seg0_idx=$vht_center_seg0" "$N"
 
 		cap_rx_stbc=$((($vht_cap >> 8) & 7))
 		[ "$rx_stbc" -lt "$cap_rx_stbc" ] && cap_rx_stbc="$rx_stbc"
@@ -461,7 +472,8 @@ mac80211_hostapd_setup_base() {
 		append base_cfg "ieee80211ax=1" "$N"
 		[ "$hwmode" = "a" ] && {
 			append base_cfg "he_oper_chwidth=$vht_oper_chwidth" "$N"
-			append base_cfg "he_oper_centr_freq_seg0_idx=$vht_center_seg0" "$N"
+			[ -n "$vht_center_seg0" ] &&
+				append base_cfg "he_oper_centr_freq_seg0_idx=$vht_center_seg0" "$N"
 		}
 
 		mac80211_add_he_capabilities \
@@ -516,7 +528,8 @@ mac80211_hostapd_setup_base() {
 		append base_cfg "ieee80211be=1" "$N"
 		[ "$hwmode" = "a" ] && {
 			append base_cfg "eht_oper_chwidth=$eht_oper_chwidth" "$N"
-			append base_cfg "eht_oper_centr_freq_seg0_idx=$eht_center_seg0" "$N"
+			[ -n "$eht_center_seg0" ] &&
+				append base_cfg "eht_oper_centr_freq_seg0_idx=$eht_center_seg0" "$N"
 		}
 	fi
 
