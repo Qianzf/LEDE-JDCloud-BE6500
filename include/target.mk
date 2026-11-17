@@ -58,7 +58,7 @@ DEFAULT_PACKAGES.router:=\
 	iptables-mod-tproxy iptables-mod-extra ipset ip-full default-settings luci luci-proto-ipv6 \
 	ddns-scripts_aliyun ddns-scripts_dnspod luci-app-ddns luci-app-upnp luci-app-autoreboot luci-theme-design \
 	luci-app-arpbind luci-app-filetransfer luci-app-vsftpd luci-app-ssr-plus luci-app-vlmcsd \
-	luci-app-accesscontrol luci-app-nlbwmon luci-app-turboacc luci-app-wol curl ca-certificates \
+	luci-app-nlbwmon luci-app-wolplus curl ca-certificates \
 	kmod-sched-core kmod-sched-bpf kmod-xdp-sockets-diag kmod-veth
 
 ifneq ($(DUMP),)
