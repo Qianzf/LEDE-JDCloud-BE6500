@@ -7,7 +7,7 @@
 #include "ipq5332-common-wifi.dtsi"
 
 / {
-	model = "JDCloud RE-CS-06";
+	model = "JDCloud RE-CS-06/BE6500";
 	compatible = "jdcloud,re-cs-06", "qcom,ipq5332";
 
 	aliases {

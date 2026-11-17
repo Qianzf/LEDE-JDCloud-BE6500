@@ -1,0 +1,28 @@
+#!/bin/sh
+# 默认 WiFi 名称（首次启动生效，仅执行一次）
+#   2.4G  -> JDCwifi
+#   5G/6G -> JDCwifi-5G
+#
+# mac80211 的默认 SSID 是 "LEDE"，这里按 radio 的 band 覆盖掉。
+# 必须在 /etc/config/wireless 生成之后执行：target 里的
+# 95-gl-wireless-country 已经会跑 `wifi config`，本脚本编号更大、后执行；
+# 万一没有（例如手工删过配置），这里补一次。
+[ -f /etc/config/wireless ] || /sbin/wifi config >/dev/null 2>&1
+
+for iface in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+	case "$iface" in
+		default_radio*) ;;
+		*) continue ;;			# 只改出厂生成的那几个默认 iface
+	esac
+
+	dev=$(uci -q get "wireless.$iface.device")
+	band=$(uci -q get "wireless.$dev.band")
+
+	case "$band" in
+		5g|6g) uci set "wireless.$iface.ssid=JDCwifi-5G" ;;
+		*)     uci set "wireless.$iface.ssid=JDCwifi" ;;
+	esac
+done
+
+uci commit wireless
+exit 0
