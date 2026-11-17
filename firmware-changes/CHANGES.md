@@ -717,6 +717,9 @@ CONFIG_BRIDGE=y         CONFIG_VETH=m          CONFIG_OVERLAY_FS=y
 
 # 第三轮：无线真正出信号（build14 → build17）
 
+> 本节只记录结论。完整排查过程（日志原文、ftrace、厂商内核反汇编、逐轮对照实验、
+> 被否决的方案）见 **[WIFI-FIX.md](WIFI-FIX.md)**。
+
 前两轮解决了"Q6 能启动"，但设备仍然没有 SSID。本轮定位到三个独立故障并逐个修掉。
 
 ## 12. 故障一：两颗芯片固件版本不一致 → MLO 断言 → 重启循环
