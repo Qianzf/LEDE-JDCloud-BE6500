@@ -900,3 +900,60 @@ target/linux/qualcommbe/Makefile:   wpad-basic-mbedtls → wpad-mbedtls
 | 2.4G 出 HE20 并实测打流 | 待 build17 刷机后验证 |
 | 三频（5.2+5.8 或 6G） | 硬件 QCN9274 为双频，但 DTS `qcom,num-radios=<1>` 只暴露 2 个 band；国内 6GHz 未开放，暂不展开 |
 | `products-sha256sums.txt` | 需按每次出包更新 |
+
+---
+
+# 第四轮：开机 60 秒黑洞（build19 → build21）
+
+## 17. 故障四：Q6 上电被固件加载器阻塞 60 秒
+
+### 17.1 现象
+
+无线可用要 ~140 s。时间线里 `ath12k_wifi7_ahb` 打完 `Hardware name: ipq5332 hw1.0`
+（8.7 s）之后，**整整 60.8 秒没有任何日志**，然后才 `powering up q6wcss`（69.6 s）。
+之前多次误判为 CAC 慢（CAC 恰好也是 ~60 s）。
+
+### 17.2 根因
+
+1. ath12k 对 AHB（SoC 内的 IPQ5332）先试 **fw api 2**（单文件 `firmware-2.bin`），
+   拿不到再回退 **api 1**（`q6_fw0.mdt` + `q6_fw1.mdt`）。
+2. 板子的固件包里 `ath12k/IPQ5332/hw1.0/` **没有 `firmware-2.bin`**（原厂就没带，
+   42 个文件里只有 q6_fw0.* / q6_fw1.* 分离镜像）。
+3. `request_firmware()` 缺文件时进入 userspace 回退路径，等
+   `FW_LOAD_TIMEOUT_MS = 60000` 毫秒才返回 `-110`（`-ETIMEDOUT`）。
+
+### 17.3 修复
+
+补丁 `919-ath12k-request-optional-fw-api2-without-fallback.patch`：把这个**可选**探测
+改用 `request_firmware_direct()`，缺文件立即 `-ENOENT` 回退 api 1，不再等 userspace。
+影响面仅此一次请求，全局固件热插拔回退保持开启。
+
+（曾用「`ignore_sysfs_fallback=1`」的全局方案，效果相同但会关掉全系统的固件热插拔回退，
+维护性差，已弃用。）
+
+### 17.4 实测
+
+| 状态 | `Hardware name` → `powering up q6wcss` | 全局回退 |
+|---|---|---|
+| 原始 | 8.747 s → 69.601 s（60.8 s，`-110`） | 开 |
+| sysctl 方案（build20，弃用） | 8.934 s → 8.966 s（32 ms） | 关 |
+| **补丁 919（build21）** | **8.824 s → 8.832 s（8 ms）** | **开** |
+
+### 17.5 附带改动
+
+`.config` 打开 `CONFIG_PACKAGE_ATH_DEBUG=y`（经
+`package/kernel/mac80211/ath-qualcommbe.mk:45` 映射到 `CPTCFG_ATH12K_DEBUG`）。
+模块 927,456 B → 1,046,000 B，默认 `debug_mask=0` 不产生任何日志；需要时可运行时
+`echo 0x... > /sys/module/ath12k/parameters/debug_mask`，不必重编。
+
+⚠️ OpenWrt 的模块参数文件是 **`/etc/modules.conf`**（`ubox/kmodloader.c: load_options()`），
+不是 `/etc/modprobe.d/*.conf` —— 放错位置参数会静默失效。
+
+### 17.6 出包
+
+| 版本 | sysupgrade sha256 | 说明 |
+|---|---|---|
+| build19 | — | 去掉 `luci-app-wol`，验证 802.11k/v |
+| build20 | `3c4bd8bf668ff2bea02df6ab378cecbc3b30090057afa6dffe6c917ecb9b6c58` | sysctl 全局方案（**弃用**，勿刷） |
+| **build21** | `87de9ef25897c131e3db43eb08c8b174f0dcc38d07c1cd0be45738793cf8b696` | **最终版**：补丁 919 + 调试模块 + 无 wol |
+| build21 factory | `9d2d1021c9624ded798bd2bd833c03f6a84852044a7b668e8b670662baa2b7eb` | |

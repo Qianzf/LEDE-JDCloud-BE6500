@@ -1,0 +1,78 @@
+From: Pi <pi@local>
+Date: Tue, 17 Nov 2026 23:55:00 +0800
+Subject: [PATCH] wifi: ath12k: do not wait for userspace on the optional fw api 2 image
+
+ath12k_fw_map() probes for the "fw api 2" image (firmware-2.bin) and falls
+back to the split amss/m3 images (q6_fw0.mdt + q6_fw1.mdt) when it is not
+available.  The probe used request_firmware_nowarn(), which still goes
+through the userspace fallback path: when the file is absent the firmware
+loader waits the full FW_LOAD_TIMEOUT_MS (60 s) for a userspace helper to
+supply it before returning -ETIMEDOUT.
+
+The IPQ5332 firmware releases used by the JDCloud RE-CS-600/BE6500 do not
+ship firmware-2.bin at all (only q6_fw0.* / q6_fw1.*), so every boot was
+stalled for a minute inside ath12k_wifi7_ahb_probe() before the Q6 remote
+processor was powered up:
+
+  [    8.747] ath12k_wifi7_ahb c000000.wifi: Wi-Fi 7 Hardware name: ipq5332 hw1.0
+  [   69.596] ath12k_wifi7_ahb c000000.wifi: failed to load firmware-2.bin: -110
+  [   69.596] ath12k_wifi7_ahb c000000.wifi: using fw api 1
+  [   69.601] remoteproc remoteproc0: powering up q6wcss
+
+Use request_firmware_direct() for this optional probe so the missing file is
+reported immediately (-ENOENT instead of -ETIMEDOUT) and the fallback to
+fw api 1 happens right away:
+
+  [    8.934] ath12k_wifi7_ahb c000000.wifi: Wi-Fi 7 Hardware name: ipq5332 hw1.0
+  [    8.958] ath12k_wifi7_ahb c000000.wifi: failed to load firmware-2.bin: -2
+  [    8.966] remoteproc remoteproc0: powering up q6wcss
+  [    9.157] remoteproc remoteproc0: remote processor q6wcss is now up
+
+Because the change is limited to this single optional request, the global
+userspace fallback path (needed by other drivers) stays enabled.
+
+--- a/drivers/net/wireless/ath/ath12k/fw.c
++++ b/drivers/net/wireless/ath/ath12k/fw.c
+@@ -7,6 +7,33 @@
+ 
+ #include "debug.h"
+ 
++/*
++ * The fw api 2 image is optional: when it is missing the driver falls back to
++ * the split amss/m3 images.  Use request_firmware_direct() so a missing file
++ * fails immediately instead of blocking the probe for the full 60 second
++ * userspace fallback timeout (FW_LOAD_TIMEOUT_MS).  On IPQ5332 the fw api 2
++ * image is not shipped at all, so the blocking behaviour added a minute to
++ * every boot.
++ */
++static const struct firmware *ath12k_fw_request_optional(struct ath12k_base *ab,
++							 const char *name)
++{
++	const struct firmware *fw;
++	char path[100];
++	int ret;
++
++	ath12k_core_create_firmware_path(ab, name, path, sizeof(path));
++
++	ret = request_firmware_direct(&fw, path, ab->dev);
++	if (ret)
++		return ERR_PTR(ret);
++
++	ath12k_dbg(ab, ATH12K_DBG_BOOT, "boot firmware request %s size %zu\n",
++		   path, fw->size);
++
++	return fw;
++}
++
+ static int ath12k_fw_request_firmware_api_n(struct ath12k_base *ab,
+ 					    const char *name)
+ {
+@@ -16,7 +43,7 @@
+ 	const u8 *data;
+ 	__le32 *timestamp;
+ 
+-	ab->fw.fw = ath12k_core_firmware_request(ab, name);
++	ab->fw.fw = ath12k_fw_request_optional(ab, name);
+ 	if (IS_ERR(ab->fw.fw)) {
+ 		ret = PTR_ERR(ab->fw.fw);
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT, "failed to load %s: %d\n", name, ret);

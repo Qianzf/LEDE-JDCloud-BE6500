@@ -703,3 +703,230 @@ iwinfo | grep -A1 wlan0-0       # 期望 Channel 6 + HT Mode: HE20
 | 2.4G A-MSDU 真实性 | 待客户端实测打流 | 若打流异常，回退补丁 331 即可 |
 | `products-sha256sums.txt` | 需更新 | 每次出包更新 |
 | 内网 gitea（10.0.0.166:1005） | 不可达 | 恢复后补推 |
+
+---
+
+## 14. 故障 7：开机 60 秒黑洞 —— `firmware-2.bin` 请求超时（已修复）
+
+### 14.1 现象
+
+开机后 Q6（WCSS）迟迟不上电，无线要 140 秒才可用。早期被误判为 "CAC 慢" / "DFS 卡住"，
+因为 CAC 的 60 s 正好和黑洞时长吻合。实际两回事。
+
+真实时间线（修复前）：
+
+```
+[   8.747] ath12k_wifi7_ahb c000000.wifi: Wi-Fi 7 Hardware name: ipq5332 hw1.0
+   ...... 60.8 秒什么都没有，驱动在 request_firmware() 里阻塞 ......
+[  69.596] ath12k_wifi7_ahb c000000.wifi: failed to load firmware-2.bin: -110
+[  69.596] ath12k_wifi7_ahb c000000.wifi: using fw api 1
+[  69.601] remoteproc remoteproc0: powering up q6wcss
+[  69.797] remoteproc remoteproc0: remote processor q6wcss is now up
+```
+
+### 14.2 根因
+
+1. ath12k 对 **AHB（SoC 内置 IPQ5332）** 这一路，先尝试 **fw api 2**（单文件
+   `ath12k/IPQ5332/hw1.0/firmware-2.bin`），失败再回退 **fw api 1**
+   （`q6_fw0.mdt` + `q6_fw1.mdt` 分离镜像）。
+2. 我们使用的 IPQ5332 固件（`WLAN.WBE.1.6-01270`，`ath-firmware-ddwrt` 包）里
+   **没有 `firmware-2.bin`** —— 该文件只有 `QCN9274/hw2.0/` 那一路才有（16 MB）。
+   ```sh
+   ls /lib/firmware/ath12k/IPQ5332/hw1.0/firmware-2.bin   # No such file
+   ```
+3. `request_firmware()` 先直读 `/lib/firmware`，失败后落到 **userspace fallback**
+   （`drivers/base/firmware_loader/fallback.c`），等待 udev/hotplug 把文件写进
+   `/sys/class/firmware/.../data`，超时时间写死为：
+   ```c
+   #define FW_LOAD_TIMEOUT_MS 60000     /* 60 s */
+   ```
+   OpenWrt 上没有任何东西会提供这个文件，于是每次开机白白等 **60.8 秒**，
+   返回 `-110`（`-ETIMEDOUT`）。
+
+> 注意区别：`-110` 是"等超时"，`-2`（`-ENOENT`）是"立刻没找到"。
+> 看到 `-110` 就说明有 60 s 在等 userspace。
+
+### 14.3 修复（最终方案：补丁 919）
+
+`target/linux/...` 不动，改驱动：`package/kernel/mac80211/patches-qualcommbe/ath12k/`
+`919-ath12k-request-optional-fw-api2-without-fallback.patch`
+
+```c
+/* drivers/net/wireless/ath/ath12k/fw.c */
+static const struct firmware *ath12k_fw_request_optional(struct ath12k_base *ab,
+                                                         const char *name)
+{
+        const struct firmware *fw;
+        char path[100];
+        int ret;
+
+        ath12k_core_create_firmware_path(ab, name, path, sizeof(path));
+
+        ret = request_firmware_direct(&fw, path, ab->dev);   /* 不进入 userspace 回退 */
+        if (ret)
+                return ERR_PTR(ret);
+
+        ath12k_dbg(ab, ATH12K_DBG_BOOT, "boot firmware request %s size %zu\n",
+                   path, fw->size);
+
+        return fw;
+}
+
+/* ath12k_fw_request_firmware_api_n() 里 */
+-       ab->fw.fw = ath12k_core_firmware_request(ab, name);
++       ab->fw.fw = ath12k_fw_request_optional(ab, name);
+```
+
+要点：
+
+- `firmware-2.bin` 是**可选**镜像，`ath12k_fw_map()` 拿不到就回退 api 1，语义上本来就
+  不该阻塞。`request_firmware_direct()` 只查 `/lib/firmware`，不走
+  `fw_load_from_user_helper()`，因此缺文件立刻 `-ENOENT`。
+- 影响面**只有这一次请求**：全局 userspace 固件回退（供 caldata / 其他设备用）保持开启。
+- 那条 `failed to load firmware-2.bin` 是 `ath12k_dbg(ATH12K_DBG_BOOT)`，默认
+  `debug_mask=0` 时**不打印**，所以生产日志里看不到这条"失败"。
+- 不能无条件跳过这个请求：同板 PCI 卡（`QCN9274/hw2.0`）**确实有并用着** `firmware-2.bin`：
+  ```
+  [  10.501] ath12k_wifi7_pci 0001:01:00.0: boot firmware request .../QCN9274/hw2.0/firmware-2.bin size 16085048
+  [  10.501] ath12k_wifi7_pci 0001:01:00.0: using fw api 2
+  ```
+
+#### 曾经用过、已放弃的方案
+
+在 `S09ath12k-caldata` 里写 `/proc/sys/kernel/firmware_config/ignore_sysfs_fallback=1`。
+效果一样（开机黑洞消失），但它是**全局**开关：所有驱动的所有固件请求都不再走
+userspace 回退（不再发 uevent、不再等），以后任何依赖热插拔供固件的设备会**静默失败**。
+功能上对本机等价，维护性差，故弃用。
+
+### 14.4 效果（实测三种状态对比）
+
+| 状态 | `Hardware name` → `powering up q6wcss` | 全局固件回退 |
+|---|---|---|
+| 原始 bug | 8.747 s → 69.601 s（**60.8 s**，`-110`） | 开 |
+| sysctl 方案（build20，弃用） | 8.934 s → 8.966 s（32 ms） | **关** |
+| **补丁 919（build21，最终）** | **8.824 s → 8.832 s（8 ms）** | **开** ✔ |
+
+完整启动时间线（build21 / 919，`debug_mask=0`）：
+
+```
+[ 8.824] ath12k_wifi7_ahb c000000.wifi: Wi-Fi 7 Hardware name: ipq5332 hw1.0
+[ 8.832] remoteproc remoteproc0: powering up q6wcss
+[ 9.039] remoteproc remoteproc0: remote processor q6wcss is now up
+[ 9.070] ath12k_wifi7_pci 0001:01:00.0: Wi-Fi 7 Hardware name: qcn9274 hw2.0
+[ 9.5 ] logread: Interface 'lan' is now up
+[19.9 ] logread: Wireless device 'radio0' / 'radio1' is now up
+```
+
+### 14.5 定位手法（可复用）
+
+驱动自带的 `ath12k_dbg()` 默认是**空的**（`__ath12k_dbg()` 在
+`CPTCFG_ATH12K_DEBUG` 未开时编译成 no-op），所以光设 `debug_mask` 模块参数没用：
+
+```sh
+cat /sys/module/ath12k/parameters/debug_mask     # 有参数
+nm -D /lib/modules/$(uname -r)/ath12k.ko | grep ath12k_dbg   # 0 → 调试代码被编掉了
+```
+
+真正的开关是构建选项：
+
+```make
+# package/kernel/mac80211/ath-qualcommbe.mk:45
+config-$(CONFIG_PACKAGE_ATH_DEBUG) += ATH_DEBUG ATH10K_DEBUG ATH11K_DEBUG ATH12K_DEBUG ...
+```
+
+即 `.config` 里 `CONFIG_PACKAGE_ATH_DEBUG=y`（编译后模块 927 KB → 1044 KB）。
+
+⚠️ **注意 OpenWrt 读的是 `/etc/modules.conf`，不是 `/etc/modprobe.d/*.conf`**
+（`ubox/kmodloader.c:load_options()` 里 `fopen("/etc/modules.conf")`）。放错地方
+参数会静默失效 —— 这就是第一轮"加了参数却没日志"的原因。
+
+```sh
+# /etc/modules.conf
+options ath12k debug_mask=0x10861     # AHB|BOOT|MGMT|PCI|CE… 见 drivers/net/wireless/ath/ath12k/debug.h
+```
+
+调试模块可以**留在镜像里但默认 mask=0**，需要时 `echo 0x... > /sys/module/ath12k/parameters/debug_mask`
+即可，不必重编。注意 mask 开大了（尤其 `0x10000 CE`）会秒刷满 ring buffer，
+把早期启动日志顶掉，排查完立刻归零。
+
+---
+
+## 15. DFS / CAC 行为说明（不是故障）
+
+排查过程中多次把 CAC 当成"5G 起不来"，这里把事实钉住。
+
+### 15.1 国码 CN 的信道规则
+
+```
+iw reg get        # country CN: DFS-FCC
+  (5150 - 5250 @ 80), (23), NO-OUTDOOR, AUTO-BW          # 无 DFS
+  (5250 - 5350 @ 80), (20), NO-OUTDOOR, DFS, AUTO-BW     # 有 DFS（ch52/56/60/64）
+  (5725 - 5850 @ 80), (33)
+```
+
+`iw phy phy0 info`：ch36/40/44/48 无 `radar detection`；ch52 起有。
+
+### 15.2 为什么 ch36 + 160 MHz 也要 CAC
+
+`EHT160` 时 `primary=36 / seg0=50` → 实际占用 **5170–5330 MHz**，跨过 5250，
+带宽里含 DFS 子信道，于是 `cfg80211_chandef_dfs_required()` 返回 1：
+
+```c
+/* net/wireless/chan.c */
+cfg80211_chandef_dfs_required() → cfg80211_get_chans_dfs_required()
+    /* 用 for_each_subchan() 遍历整个工作带宽，而不是只看主 20 MHz */
+```
+
+结论：**CAC 是按整条工作带宽判定的**。
+- ch36 + `EHT80`（5180–5250）→ 不含 DFS 子信道 → 无 CAC，`HT_SCAN->ENABLED` 约 1 秒。
+- ch149 + `EHT80` → 无 CAC，最稳。
+- ch36 + `EHT160` → 有 CAC，约 60 s（实测 93 s，含扫描/切换开销）。
+
+CAC 期间 `Tx-Power 0 dBm` 是**正常**的，CAC 完成后自动变成 30 dBm。
+
+### 15.3 DFS 失败不会自动重试
+
+如果 CAC 被打断（例如手动 `iw dev wlan0-1 del`），hostapd 会停在 `HAPD_IFACE_DISABLED`：
+
+```
+dfs.c:941      DFS start_dfs_cac() failed, %d      → return -1
+hostapd.c:2628 hostapd_handle_dfs() < 0            → goto fail
+hostapd.c:2830 fail:                              → AP_EVENT_DISABLED, 状态永久 DISABLED
+```
+
+`terminate_on_error=0`、`setup_complete_cb` 只在 `hostapd.c:650` 置 NULL，
+所以 `hostapd_interface_setup_failure_handler` **永远不会被调用**，OpenWrt 的
+`mac80211.sh` / `hostapd.sh` 里也没有 `AP-DISABLED` 处理 —— 只能手动
+`wifi reload` 恢复。**排查时不要用 `iw dev ... del` 打断 CAC。**
+
+### 15.4 ch36 → ch40 自动漂移（hostapd 的"挪主信道"）
+
+日志里会看到：
+
+```
+"Switch own primary and secondary channel to get secondary channel with no Beacons from other BSSes"
+```
+
+来源：
+
+```c
+/* src/ap/hw_features.c:300-311 ieee80211n_switch_pri_sec() */
+if (secondary_channel > 0) { channel += 4; freq += 20; secondary_channel = -1; }
+
+/* src/common/hw_features_common.c:202 check_40mhz_5g() */
+if (sec_bss && !pri_bss) return 2;   /* 邻居在 ch40 有 beacon，ch36 干净 */
+```
+
+触发条件：`ieee80211n_check_40mhz()`（`hw_features.c:570`）在扫到邻居后判定
+"ch36 有干扰 / ch40 更干净"，就把主信道挪到 40。配置里 `channel=36` 不会变，
+**这是合法行为，不是 bug**。想关掉只能在 hostapd conf 里加 `noscan`，但那会
+放弃 40/80/160 的共存检测，得不偿失（曾打过补丁 991 强制不挪，已判定无用并回退）。
+
+### 15.5 不要热解绑 ath12k
+
+```sh
+echo c000000.wifi > /sys/bus/platform/drivers/ath12k_wifi7_ahb/unbind   # ⛔ 内核 panic
+```
+
+多 radio wiphy + hw group + rproc notifier + PPE ring 的 remove 路径没测过，
+实测直接 panic 并自动重启（tmpfs 里的 logread 一起丢）。要重载驱动就整体 reboot。
