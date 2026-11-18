@@ -1,3 +1,4 @@
+#!/bin/sh
 PKG_NAME="$1"
 CURDIR="$2"
 PKG_BUILD_DIR="$3"
