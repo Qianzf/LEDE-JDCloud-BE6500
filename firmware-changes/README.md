@@ -140,6 +140,29 @@ FORCE_UNSAFE_CONFIGURE=1 make -j4 V=w 2>&1 | tee build.log
 偏移 0x700000+  squashfs rootfs
 ```
 
+对应到 GPT 分区（编号为本机实测，**别的机型不要照抄**，按 `PARTNAME` 查）：
+
+| factory.bin 内偏移 | 内容 | 目标分区名 | 本机节点 | 分区大小 |
+|---|---|---|---|---|
+| `0x000000` | 内核 FIT | `0:HLOS` | `/dev/mmcblk0p21` | 7,340,032 B（7168 KiB） |
+| `0x700000` | squashfs rootfs | `rootfs` | `/dev/mmcblk0p23` | 2 GiB |
+
+要点：
+
+- `0:HLOS`(p21) 与 `rootfs`(p23) **中间夹着 `0:HLOS_1`(p22，同为 7 MiB)**，
+  所以**不能把 factory.bin 整段 `dd` 到 p21**，必须按分区分别写。
+- 原厂 OTA 也是分开写的，`flash.scr` 里就是两条：
+  `xtract_n_flash $imgaddr hlos-… 0:HLOS` 和 `xtract_n_flash $imgaddr rootfs-… rootfs`。
+- 我们不写 `0:WIFIFW`（原厂 12 MiB 的无线固件分区），ath12k 的固件随 rootfs 安装；
+  该分区留在原地不冲突。
+- 查分区名：
+
+  ```sh
+  for p in /sys/block/mmcblk0/mmcblk0p*/; do
+      echo "$(basename $p) $(grep PARTNAME $p/uevent | cut -d= -f2)"
+  done
+  ```
+
 ---
 
 ## 5. 刷机后验证

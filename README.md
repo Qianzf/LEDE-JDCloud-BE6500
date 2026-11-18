@@ -13,7 +13,7 @@
 | 平台 | Qualcomm `qualcommbe` / `ipq53xx` |
 | SoC | IPQ5322（4×A53 aarch64，musl） |
 | 无线 | QCN6224，Wi-Fi 7（802.11be）双频 4×4 |
-| 存储 | eMMC，UBI + squashfs |
+| 存储 | eMMC（GPT 分区），squashfs 根文件系统 + f2fs overlay |
 | 内核 | Linux 6.18 |
 | 镜像 | `squashfs-sysupgrade`（保留配置升级）/ `squashfs-factory`（整机写入），约 150 MB |
 
@@ -82,4 +82,4 @@ make defconfig && make -j$(nproc) V=w
 ## 说明
 
 - 本项目只是上述 LEDE 源码的一个定制分支，遵循其原始许可证（GPL-2.0）。
-- 刷机有风险，自担；`factory` 镜像会重写 UBI，务必确认机型相符。
+- 刷机有风险，自担；`factory` 镜像会写 `0:HLOS` 与 `rootfs` 两个分区，务必确认机型相符。

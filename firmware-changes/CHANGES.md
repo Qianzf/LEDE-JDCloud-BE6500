@@ -288,12 +288,17 @@ make[5]: *** [...-squashfs-factory.bin] Error 1
 `target/linux/qualcommbe/image/ipq53xx.mk:59` 的注释写得很清楚：
 
 ```
-# The kernel FIT is dd'd into 0:HLOS (mmcblk0p12, 7 MiB) ...
-# A default build is ~5.75 MiB, so refuse to build anything
-# the partition cannot hold. A truncated kernel never boots.
+# The kernel FIT is dd'd into 0:HLOS (mmcblk0p12, 7 MiB) by
+# glinet_emmc_do_fit_upgrade() with no size check; ...
 ```
 
-HLOS 分区物理上就是 7 MiB，调大 = 内核被截断 = 变砖。只能把内核压小。
+注意这段注释是给 **GL-BE9300** 写的，那台机器的 `0:HLOS` 正好是 `mmcblk0p12`。
+本机 JDCloud RE-CS-06 的分区号不同：**`0:HLOS` = `mmcblk0p21`**，`mmcblk0p12` 是
+`0:CDT`。分区名才是稳定的（`/sys/block/mmcblk0/mmcblk0p*/uevent` 里的 `PARTNAME`），
+分区号各机型不要硬编码。
+
+结论不变：`0:HLOS` 物理大小就是 **7,340,032 B（7168 KiB）**，我们的
+`KERNEL_SIZE := 7168k` 与之完全相等，调大 = 内核被截断 = 变砖。只能把内核压小。
 
 ### 定位过程（含一个排除项）
 
