@@ -45,6 +45,28 @@
 
 - `luci-theme-vantage` + 中文语言包，`luci-i18n-base-zh-cn`
 
+## 硬件加速（PPE，开源实现）
+
+转发硬件加速用的是**上游开源 PPE 驱动**，不是原厂那套闭源 NSS：
+
+| 组件 | 说明 |
+|---|---|
+| `qcom-ppe` | `drivers/net/ethernet/qualcomm/ppe/`（EDMA + PPE flowtable），SPDX `GPL-2.0-only`，© Qualcomm Innovation Center 2025，随镜像内置 |
+| `macremapper` | Dual-Channel Wi-Fi MAC 重映射，Wi-Fi 流量进入 PPE 所需 |
+| ath12k Direct Switch | 补丁 `906-ath12k-native-ppe-direct-switch.patch`（Kconfig `ATH12K_PPE_DS_SUPPORT`），Wi-Fi ↔ PPE 零拷贝 DMA |
+| `nft` flowtable | `flags offload`，把 wan / lan* / wlan* 的流表卸载到 PPE |
+
+自查（均为只读）：
+
+```sh
+lsmod | grep -E "qcom_ppe|macremapper"
+cat /sys/kernel/debug/ppe/direct_switch   # 期望 running:1 faulted:0
+cat /sys/kernel/debug/ppe/flows           # fwd_type 与 hw_fwd_type 一致 = 硬件转发
+```
+
+和原厂（闭源 `qca-nss-ppe` + `ecm` + `qca-nss-dp`）相比，覆盖范围基本相当，
+区别是这套有源码、可读可改可打补丁。
+
 ## 支持程度
 
 **可用**：日常路由 / NAT 加速 / Wi-Fi 7 双频 4×4（2.4G HE20、5G EHT80/EHT160）/
