@@ -20,13 +20,23 @@ define Host/Install
 	$(call Host/Uninstall)
 	$(INSTALL_DIR) $(1)/share/aclocal
 	$(INSTALL_DATA) $(HOST_BUILD_DIR)/m4/*.m4 $(1)/share/aclocal/
+	# gnulib 的 cond.m4 与 automake 的 cond.m4 同名：前者只定义 gl_COND，
+	# 后者定义 AM_CONDITIONAL，而 aclocal 对同名 *.m4 只采用第一个命中的。
+	# 装进 share/aclocal 后会遮蔽 automake 的那份，导致 autoreconf 报
+	# "possibly undefined macro: AM_CONDITIONAL" / "cannot find required
+	# auxiliary files: ar-lib"（dcwapd 等 autotools 包因此构建失败）。
+	# 换个文件名：仍会被 aclocal 扫描（gl_COND 不丢），但不再遮蔽。
+	[ ! -f $(1)/share/aclocal/cond.m4 ] || \
+		mv -f $(1)/share/aclocal/cond.m4 $(1)/share/aclocal/gnulib-cond.m4
 	$(CP) $(HOST_BUILD_DIR)/ $(1)/share/gnulib/
 	ln -sf ../share/gnulib/gnulib-tool $(STAGING_DIR_HOST)/bin/gnulib-tool
 endef
 
 define Host/Uninstall
 	rm -rf $(STAGING_DIR_HOST)/bin/gnulib-tool $(STAGING_DIR_HOST)/share/gnulib
-	rm -f $(STAGING_DIR_HOST)/share/aclocal/gl_*.m4
+	rm -f $(STAGING_DIR_HOST)/share/aclocal/gl_*.m4 \
+		$(STAGING_DIR_HOST)/share/aclocal/cond.m4 \
+		$(STAGING_DIR_HOST)/share/aclocal/gnulib-cond.m4
 endef
 
 $(eval $(call HostBuild))
