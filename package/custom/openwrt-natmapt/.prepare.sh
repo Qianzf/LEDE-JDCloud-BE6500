@@ -1,3 +1,4 @@
+#!/bin/sh
 VERSION="$1"
 CURDIR="$2"
 BIN_PATH="$3"

@@ -61,7 +61,7 @@ exit 0
 endef
 
 define Package/natmapt/install
-	$(CURDIR)/.prepare.sh $(VERSION) $(CURDIR) $(PKG_BUILD_DIR)/bin/natmap
+	sh $(CURDIR)/.prepare.sh $(VERSION) $(CURDIR) $(PKG_BUILD_DIR)/bin/natmap
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/bin/natmap $(1)/usr/bin/
 	$(INSTALL_DIR) $(1)/usr/lib/natmap/
