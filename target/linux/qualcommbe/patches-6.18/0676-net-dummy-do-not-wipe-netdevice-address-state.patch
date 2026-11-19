@@ -1,0 +1,38 @@
+From: Qianzf <qianzf@users.noreply.github.com>
+Subject: [PATCH] net: dummy: do not wipe netdevice address state
+
+alloc_netdev_mqs() calls dev_addr_init() before setup(), which points
+dev->dev_addr at the first hardware address entry. init_dummy_netdev()
+then clears the whole net_device, so every dummy device ends up with
+dev->dev_addr == NULL and an empty dev_addrs list.
+
+free_netdev() -> dev_addr_flush() -> dev_addr_check() then evaluates
+memcmp(NULL, dev->dev_addr_shadow, MAX_ADDR_LEN) and faults:
+
+  Unable to handle kernel access to user memory outside uaccess routines
+  at virtual address 0000000000000000
+  Internal error: Oops: 0000000096000005 [#1] SMP
+  dev_addr_check -> dev_addr_flush -> free_netdev -> ppe_ds_free
+  -> qcom_ppe_ds_unregister -> ath12k_wifi7_ds_cleanup
+
+This is hit by the qcom-ppe Direct Switch teardown, which frees the NAPI
+dummy netdev it allocated with alloc_netdev_dummy(). Upstream dropped the
+memset from init_dummy_netdev() for the same reason; backport that part
+only and keep the (now redundant) re-initialisation helpers here instead
+of moving them into alloc_netdev_dummy().
+---
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -11596,7 +11596,11 @@
+  */
+ void init_dummy_netdev(struct net_device *dev)
+ {
+-	memset(dev, 0, sizeof(struct net_device));
++	/* Do not clear the whole structure here: alloc_netdev_mqs() already
++	 * initialised the device address lists, and wiping them leaves
++	 * dev->dev_addr NULL, which makes free_netdev() -> dev_addr_check()
++	 * dereference NULL for every dummy netdev.
++	 */
+ 	INIT_LIST_HEAD(&dev->napi_list);
+ 	mutex_init(&dev->lock);
+ 	dev_net_set(dev, &init_net);

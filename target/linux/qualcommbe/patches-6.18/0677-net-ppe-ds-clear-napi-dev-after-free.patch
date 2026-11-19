@@ -1,0 +1,23 @@
+From: Qianzf <qianzf@users.noreply.github.com>
+Subject: [PATCH] net: ppe: clear the NAPI dummy netdev pointer after freeing it
+
+ppe_ds_free() frees ds->napi_dev but leaves the pointer in place before
+kfree()ing the DS object, so a repeated qcom_ppe_ds_unregister() on the
+same handle walks freed memory and calls free_netdev() again, which ends
+in dev_addr_check() dereferencing NULL after dev_addr_flush().
+
+Clear the field while the DS object is still valid. This does not make
+qcom_ppe_ds_unregister() idempotent (it frees the handle itself), it only
+keeps the failure mode of a duplicated teardown from being a NULL pointer
+oops on a released net_device.
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_ds.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_ds.c
+@@ -592,6 +592,7 @@ static void ppe_ds_free(struct qcom_ppe_ds *ds)
+ 	if (ds->napi_dev) {
+ 		netif_napi_del(&ds->napi);
+ 		free_netdev(ds->napi_dev);
++		ds->napi_dev = NULL;
+ 	}
+ 	if (ds->fill)
+ 		dma_free_coherent(dev, rx * sizeof(*ds->fill), ds->fill, ds->fill_dma);
