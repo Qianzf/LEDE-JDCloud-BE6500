@@ -1,5 +1,5 @@
 From: Qianzf <qianzf@example.com>
-Date: Sat, 21 Nov 2026 04:45:00 +0800
+Date: Sat, 21 Nov 2026 09:10:00 +0800
 Subject: [PATCH] ath12k: advertise a pool of MAC addresses to mac80211
 
 ath12k only sets the wiphy permanent address and never advertises
@@ -24,15 +24,16 @@ Signed-off-by: Qianzf <qianzf@example.com>
 ---
 --- a/drivers/net/wireless/ath/ath12k/core.h
 +++ b/drivers/net/wireless/ath/ath12k/core.h
-@@ -70,6 +70,7 @@
- #define ATH12K_INVALID_GROUP_ID  0xFF
- #define ATH12K_INVALID_DEVICE_ID 0xFF
+@@ -792,6 +792,8 @@
+ 	} incumbent_signal_interference;
+ };
  
-+#define ATH12K_MAX_MAC_ADDRS		8
- #define ATH12K_MAX_MLO_PEERS            256
- #define ATH12K_MLO_PEER_ID_INVALID      0xFFFF
- #define ATH12K_MLO_PEER_ID_PENDING      0xFFFE
-@@ -803,6 +804,9 @@
++#define ATH12K_MAX_MAC_ADDRS	8
++
+ struct ath12k_hw {
+ 	struct ieee80211_hw *hw;
+ 	struct device *dev;
+@@ -820,6 +822,9 @@
  
  	struct ath12k_dp_hw dp_hw;
  
@@ -44,7 +45,7 @@ Signed-off-by: Qianzf <qianzf@example.com>
  };
 --- a/drivers/net/wireless/ath/ath12k/mac.c
 +++ b/drivers/net/wireless/ath/ath12k/mac.c
-@@ -14771,6 +14771,32 @@
+@@ -15125,6 +15125,32 @@
  	return 0;
  }
  
@@ -77,7 +78,7 @@ Signed-off-by: Qianzf <qianzf@example.com>
  static int ath12k_mac_hw_register(struct ath12k_hw *ah)
  {
  	struct ieee80211_hw *hw = ah->hw;
-@@ -14849,6 +14875,7 @@
+@@ -15203,6 +15229,7 @@
  	wiphy->available_antennas_tx = antennas_tx;
  
  	SET_IEEE80211_PERM_ADDR(hw, mac_addr);
