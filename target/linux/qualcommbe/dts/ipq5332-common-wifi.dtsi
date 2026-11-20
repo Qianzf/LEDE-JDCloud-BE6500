@@ -3,7 +3,23 @@
 /* WCSS/MLO 布局与 VIKINGYFY/immortalwrt target 保持一致：
  * M3 dump、CALDB、MLO 共享池由驱动按需分配，不单独保留；
  * QCN9274（PCI）也不使用固定 host-DDR 保留窗口。
+ *
+ * Q6 固件（firmware memory mode 1）要求 host DDR 在 0x4b500000 附近由主机
+ * 提供 DMA 内存，因此必须给出默认 CMA 池；否则固件镜像缓冲会落到 TZ
+ * 不认可的地址，SCM 的 pas_init_image 直接返回 -EIO，Q6 起不来、无 phy。
  */
+
+/ {
+	reserved-memory {
+		linux,cma {
+			compatible = "shared-dma-pool";
+			reusable;
+			size = <0x0 0x08000000>;
+			alloc-ranges = <0x0 0x4b240000 0x0 0x34dc0000>;
+			linux,cma-default;
+		};
+	};
+};
 
 &pcie1 {
 	status = "okay";

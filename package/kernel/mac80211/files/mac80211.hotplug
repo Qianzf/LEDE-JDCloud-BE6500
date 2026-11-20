@@ -1,5 +1,9 @@
 #!/bin/sh
 
-[ "${ACTION}" = "add" ] && {
+[ "${ACTION}" = "add" ] && [ -f /etc/board.json ] && {
 	/sbin/wifi config
+	# netifd 只在启动时读 /etc/config/wireless；uci 写入不会触发它重读，
+	# 因此这里必须显式 reload，否则晚到的 phys 永远起不了 AP。
+	ubus call network reload
+	ubus call network.wireless up
 }

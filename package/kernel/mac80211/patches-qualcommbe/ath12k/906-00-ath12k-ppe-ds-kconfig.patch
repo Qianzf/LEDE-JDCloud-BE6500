@@ -1,0 +1,20 @@
+From: ViKing <viking.yfy@qq.com>
+Subject: [PATCH] wifi: ath12k: add PPE Direct Switch Kconfig option
+
+Split out of 906-01 so it applies against the local Kconfig layout.
+Signed-off-by: ViKing <viking.yfy@qq.com>
+
+--- a/drivers/net/wireless/ath/ath12k/Kconfig
++++ b/drivers/net/wireless/ath/ath12k/Kconfig
+@@ -67,3 +67,11 @@
+         depends on THERMAL
+         help
+           Enable ath12k thermal sensor support.
++
++config ATH12K_PPE_DS_SUPPORT
++	bool "Native Qualcomm PPE Direct Switch transport"
++	depends on ATH12K
++	help
++	  Build the native PPE shared-ring client on Qualcomm platforms.
++	  Requires the matching qcom-ppe Direct Switch API in the kernel.
++	  Automatically activate on platforms with a supported transport.

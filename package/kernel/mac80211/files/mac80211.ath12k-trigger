@@ -1,0 +1,18 @@
+#!/bin/sh
+
+# ath12k (ipq5332 AHB / qcn9274 PCI) 的 phy 在 boot 后段（约 13 秒）才 probe，
+# 晚于 netifd 读取 /etc/config/wireless 的时刻。此时 10-wifi-detect 可能已经
+# 写过配置，但 netifd 不会自动重读，radio 会一直是 pending 状态。
+# 这里对 ath12k 的 phy 做一次兜底：确保配置存在，并让 netifd 真正把 radio 起来。
+
+[ "${ACTION}" = "add" ] || exit 0
+
+grep -qsE '^DRIVER=ath12k(_wifi7)?_(pci|ahb)$' \
+	"/sys${DEVPATH%/ieee80211/*}/uevent" || exit 0
+
+if [ ! -f /etc/config/wireless ]; then
+	/sbin/wifi config
+	ubus call network reload
+fi
+
+ubus call network.wireless up

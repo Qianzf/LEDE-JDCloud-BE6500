@@ -213,19 +213,45 @@ __get_radio_ranges() {
 	local phy="$1"
 
 	iw phy "$phy" info | awk '
-$1 == "wiphy" && $2 == "radio" {
+function flush() {
+	if (radio != "" && start != "" && end != "")
+		printf "radio|%s|%s|%s\n", radio, start, end
+	start = end = ""
+}
+
+# iw >= 6.x: "\t\t* Idx 0:" ... "\t\t\tFrequency Range: 2402 MHz - 2482 MHz"
+$1 == "*" && $2 == "Idx" {
+	flush()
 	radio = $3
 	sub(":", "", radio)
 	next
 }
 
-$1 == "freq" && $2 == "range:" && radio != "" {
+$1 == "Frequency" && $2 == "Range:" {
 	start = $3
 	end = $6
 	sub(/\..*$/, "", start)
 	sub(/\..*$/, "", end)
-	printf "radio|%s|%s|%s\n", radio, start, end
-}'
+	next
+}
+
+# 旧格式: "wiphy radio N" 搭配 "freq range: A - B"
+$1 == "wiphy" && $2 == "radio" {
+	flush()
+	radio = $3
+	sub(":", "", radio)
+	next
+}
+
+$1 == "freq" && $2 == "range:" {
+	start = $3
+	end = $6
+	sub(/\..*$/, "", start)
+	sub(/\..*$/, "", end)
+	next
+}
+
+END { flush() }'
 }
 
 mac80211_get_band_width() {

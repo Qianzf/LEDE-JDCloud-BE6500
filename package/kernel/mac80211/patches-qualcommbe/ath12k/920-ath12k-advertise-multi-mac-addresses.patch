@@ -1,0 +1,87 @@
+From: Qianzf <qianzf@example.com>
+Date: Sat, 21 Nov 2026 04:45:00 +0800
+Subject: [PATCH] ath12k: advertise a pool of MAC addresses to mac80211
+
+ath12k only sets the wiphy permanent address and never advertises
+wiphy->addresses.  mac80211 therefore falls back to its "addr_mask" logic in
+ieee80211_get_perm_addr() (net/mac80211/iface.c), which forces the
+locally-administered bit for every interface beyond the first:
+
+	b1 = b1 ^ (((id - !(b1 & 2)) << 2) | 0x2)
+
+On ipq5332 based boards (one wiphy, two radios: 2.4 GHz + 5 GHz) this makes
+the second AP advertise a locally-administered, duplicate BSSID:
+
+	wlan0-0 (2.4 GHz) BSSID 10:04:c1:02:7f:23
+	wlan0-1 (5 GHz)   BSSID 12:04:c1:02:7f:23   (0x12 = 0x10 | 0x2)
+
+Fix by advertising a pool of consecutive addresses.  addresses[0] is always
+the permanent address, which cfg80211 requires (WARN in
+cfg80211_register_wiphy()); the remaining entries increment the last two
+octets so every VAP gets a globally unique, non-LA address.
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -70,6 +70,7 @@
+ #define ATH12K_INVALID_GROUP_ID  0xFF
+ #define ATH12K_INVALID_DEVICE_ID 0xFF
+ 
++#define ATH12K_MAX_MAC_ADDRS		8
+ #define ATH12K_MAX_MLO_PEERS            256
+ #define ATH12K_MLO_PEER_ID_INVALID      0xFFFF
+ #define ATH12K_MLO_PEER_ID_PENDING      0xFFFE
+@@ -803,6 +804,9 @@
+ 
+ 	struct ath12k_dp_hw dp_hw;
+ 
++	/* Pool of MAC addresses advertised to mac80211 */
++	struct mac_address mac_addrs[ATH12K_MAX_MAC_ADDRS];
++
+ 	/* Keep last */
+ 	struct ath12k radio[] __aligned(sizeof(void *));
+ };
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -14771,6 +14771,32 @@
+ 	return 0;
+ }
+ 
++static void ath12k_mac_setup_mac_addrs(struct ath12k_hw *ah, const u8 *addr)
++{
++	struct ieee80211_hw *hw = ah->hw;
++	struct wiphy *wiphy = hw->wiphy;
++	int i;
++
++	ether_addr_copy(ah->mac_addrs[0].addr, addr);
++
++	for (i = 1; i < ATH12K_MAX_MAC_ADDRS; i++) {
++		u16 last = (addr[4] << 8) | addr[5];
++
++		last += i;
++		ether_addr_copy(ah->mac_addrs[i].addr, addr);
++		ah->mac_addrs[i].addr[4] = last >> 8;
++		ah->mac_addrs[i].addr[5] = last & 0xff;
++	}
++
++	/* cfg80211 requires addresses[0] to be equal to perm_addr */
++	wiphy->addresses = ah->mac_addrs;
++	wiphy->n_addresses = ATH12K_MAX_MAC_ADDRS;
++
++	ath12k_generic_dbg(ATH12K_DBG_MAC,
++			   "advertising %d MAC addresses from %pM\n",
++			   ATH12K_MAX_MAC_ADDRS, addr);
++}
++
+ static int ath12k_mac_hw_register(struct ath12k_hw *ah)
+ {
+ 	struct ieee80211_hw *hw = ah->hw;
+@@ -14849,6 +14875,7 @@
+ 	wiphy->available_antennas_tx = antennas_tx;
+ 
+ 	SET_IEEE80211_PERM_ADDR(hw, mac_addr);
++	ath12k_mac_setup_mac_addrs(ah, mac_addr);
+ 	SET_IEEE80211_DEV(hw, ab->dev);
+ 
+ 	ret = ath12k_mac_setup_iface_combinations(ah);
