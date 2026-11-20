@@ -1,0 +1,141 @@
+From: Qianzf <qianzf@example.com>
+Date: Sat, 21 Nov 2026 10:45:00 +0800
+Subject: [PATCH] AP: restart the BSS when its configuration changed
+
+hostapd can only apply a subset of the BSS configuration to a running BSS.
+The SSID, BSSID, HT/VHT/HE/EHT capabilities, bridge, PMF and several other
+items are programmed into the driver only when the AP is started, and
+hostapd_set_ssid() is a no-op for AP mode.  The in-place reload path
+therefore leaves the BSS in a torn state: the beacon and the driver keep
+the old parameters while hapd->conf carries the new ones.
+
+Observed on ath12k (ipq5332, OpenWrt): after changing the SSID and applying
+it, the AP keeps beaconing the old name, clients connect to it and are
+rejected with
+
+  wlan0-0: STA ... Station tried to associate with unknown SSID 'old-name'
+
+or associate successfully and are then deauthenticated due to inactivity.
+Wi-Fi looks connected (association and 4-way handshake succeed) but carries
+no data until the interface is restarted completely.
+
+The reload path already detects this situation through the per-BSS
+config_id (the md5 of the whole generated BSS block) and flushes all
+stations, but it still attempts the in-place reload afterwards.  Instead,
+take the full disable+enable path so the new configuration reaches the
+driver through start_ap again.  Interface/radio level changes keep the
+previous behaviour for forced reloads, as the caller restarts the
+interface itself in that case.
+
+The shared reload event is sent before the reload because the interface is
+torn down and re-created, which frees hapd.
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+ src/ap/hostapd.c | 47 ++++++++++++++++++++++++++++++++++++++++++++++-
+ src/ap/ubus.c    | 17 ++++++++++++-----
+ 2 files changed, 58 insertions(+), 6 deletions(-)
+
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -276,6 +276,47 @@
+ }
+ 
+ 
++/*
++ * hostapd can only apply a subset of the BSS configuration to a running BSS:
++ * the SSID, BSSID, HT/VHT/HE/EHT capabilities, bridge, PMF and a number of
++ * other items are programmed into the driver only when the AP is started.
++ * hostapd_set_ssid() in particular is a no-op for AP mode, so an in-place
++ * reload keeps the old SSID in the beacon and in the driver while
++ * hapd->conf carries the new one - clients then associate with the old name
++ * and are rejected as "unknown SSID" (or deauthenticated for inactivity),
++ * i.e. Wi-Fi looks connected but carries no data.
++ *
++ * OpenWrt's hostapd.sh emits config_id as the md5 over the whole generated
++ * BSS block, so any BSS parameter change is visible here.  When no config_id
++ * is present (plain wpa_supplicant build), fall back to comparing the SSID,
++ * which is the change users hit most often.
++ */
++static int hostapd_bss_conf_changed(struct hostapd_config *newconf,
++				    struct hostapd_config *oldconf)
++{
++	size_t i;
++
++	for (i = 0; i < newconf->num_bss && i < oldconf->num_bss; i++) {
++		if (newconf->bss[i]->config_id && oldconf->bss[i]->config_id) {
++			if (os_strcmp(newconf->bss[i]->config_id,
++				      oldconf->bss[i]->config_id) != 0)
++				return 1;
++			continue;
++		}
++
++		if (newconf->bss[i]->ssid.ssid_len !=
++		    oldconf->bss[i]->ssid.ssid_len)
++			return 1;
++
++		if (os_memcmp(newconf->bss[i]->ssid.ssid,
++			      oldconf->bss[i]->ssid.ssid,
++			      newconf->bss[i]->ssid.ssid_len) != 0)
++			return 1;
++	}
++
++	return 0;
++}
++
+ static int hostapd_iface_conf_changed(struct hostapd_config *newconf,
+ 				      struct hostapd_config *oldconf)
+ {
+@@ -303,6 +344,7 @@
+ 	struct hapd_interfaces *interfaces = iface->interfaces;
+ 	struct hostapd_data *hapd = iface->bss[0];
+ 	struct hostapd_config *newconf, *oldconf;
++	int bss_changed;
+ 	size_t j;
+ 	int i;
+ 
+@@ -322,11 +364,19 @@
+ 		return -1;
+ 
+ 	oldconf = hapd->iconf;
+-	if (hostapd_iface_conf_changed(newconf, oldconf)) {
++	bss_changed = hostapd_bss_conf_changed(newconf, oldconf);
++	if (hostapd_iface_conf_changed(newconf, oldconf) || bss_changed) {
+ 		char *fname;
+ 		int res;
+ 
+-		if (reconf)
++		/*
++		 * A BSS level change must be applied for real, otherwise the
++		 * BSS keeps running with the old parameters (see
++		 * hostapd_bss_conf_changed()).  Interface/radio level changes
++		 * keep the previous behaviour for forced reloads: the caller
++		 * restarts the interface itself.
++		 */
++		if (reconf && !bss_changed)
+ 			return -1;
+ 
+ 		hostapd_clear_old(iface);
+--- a/src/ap/ubus.c
++++ b/src/ap/ubus.c
+@@ -203,9 +203,18 @@
+ 		   struct blob_attr *msg)
+ {
+ 	struct hostapd_data *hapd = container_of(obj, struct hostapd_data, ubus.obj);
+-	int ret = hostapd_reload_config(hapd->iface, 1);
++	struct hostapd_iface *iface = hapd->iface;
++	const char *ifname = hapd->conf->iface;
++	int ret;
+ 
+-	hostapd_send_shared_event(&hapd->iface->interfaces->ubus, hapd->conf->iface, "reload");
++	/*
++	 * Send the event before the reload: a BSS configuration change makes
++	 * hostapd_reload_config() tear down and re-create the interface, which
++	 * frees hapd (and its conf).
++	 */
++	hostapd_send_shared_event(&iface->interfaces->ubus, ifname, "reload");
++
++	ret = hostapd_reload_config(iface, 1);
+ 	return ret;
+ }
+ 
