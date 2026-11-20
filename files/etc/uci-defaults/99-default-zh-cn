@@ -26,10 +26,10 @@ esac
 uci commit luci
 
 # ---- 系统：主机名 / 时区 / NTP ---------------------------------------
-# 主机名：只有还是出厂默认 'OpenWrt' 时才改成 JDCloud
+# 主机名：只有还是出厂默认值时才改成 JDBox
 hostname=$(uci -q get system.@system[0].hostname)
 case "$hostname" in
-	''|OpenWrt) uci set system.@system[0].hostname='JDCloud' ;;
+	''|OpenWrt|LEDE) uci set system.@system[0].hostname='JDBox' ;;
 esac
 
 # 时区：只有未设置或仍是 'UTC' 时才写中国标准时间
