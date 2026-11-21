@@ -428,6 +428,10 @@ mac80211_emit_detect() {
 		set wireless.${iface}.encryption='${encryption}'
 		set wireless.${iface}.key='${key}'
 		set wireless.${iface}.disabled='0'
+
+		set wireless.${iface}.ieee80211k='1'
+		set wireless.${iface}.rrm_neighbor_report='1'
+		set wireless.${iface}.rrm_beacon_report='1'
 	EOF
 	uci -q commit wireless
 }
