@@ -101,7 +101,7 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
  #define HAL_TCL1_RING_BASE_LSB(hal) \
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
-@@ -0,0 +1,565 @@
+@@ -0,0 +1,573 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
@@ -151,6 +151,10 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
 +#define ATH12K_DS_RING_ENTRIES 2048
 +#define ATH12K_DS_BUFFER_COUNT 2048
 +#define ATH12K_DS_BUFFER_SIZE 2048
++/* nss-dp places EDMA_RX_SKB_HEADROOM + NET_IP_ALIGN (about 130) bytes in
++ * front of the payload, so every buffer must reserve room for it.
++ */
++#define ATH12K_DS_HEADROOM 192
 +#define ATH12K_DS_VP_COUNT 8
 +#define ATH12K_DS_REPAIR_BUDGET 128
 +#define ATH12K_DS_VP_TABLE 0x00a44194
@@ -222,6 +226,7 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
 +	u32 reo_map[ATH12K_MAX_DEVICES];
 +	unsigned long reo_mapped;
 +	bool tcl_ready, reo_ready, complete_ready;
++	bool headroom_warned;
 +	bool stopped, faulted, started;
 +	bool quarantined;
 +	bool hw1_compat, hw1_pending;
@@ -346,7 +351,10 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
 +	unsigned long flags;
 +	unsigned int done = 0;
 +
-+	if (size != ATH12K_DS_BUFFER_SIZE || READ_ONCE(ds->faulted))
++	/* nss-dp asks for its own size (1856/1984 depending on the memory
++	 * profile), not ours; accept anything that fits.
++	 */
++	if (size > ATH12K_DS_BUFFER_SIZE || READ_ONCE(ds->faulted))
 +		return 0;
 +	spin_lock_irqsave(&ds->tx_lock, flags);
 +	while (done < count && !list_empty(&ds->free_buffers)) {

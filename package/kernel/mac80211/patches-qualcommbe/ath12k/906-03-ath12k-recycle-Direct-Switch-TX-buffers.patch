@@ -29,7 +29,7 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
 
 --- a/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
 +++ b/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
-@@ -563,3 +563,302 @@ static const struct qcom_ppe_ds_ops ath1
+@@ -563,3 +563,305 @@ static const struct qcom_ppe_ds_ops ath1
  	.fault = ath12k_ds_transport_fault,
  };
  
@@ -124,10 +124,13 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
 +	if (!ds->buffers)
 +		return -ENOMEM;
 +	for (i = 0; i < ATH12K_DS_BUFFER_COUNT; i++) {
-+		skb = alloc_skb(ATH12K_DS_BUFFER_SIZE + DP_RX_BUFFER_ALIGN_SIZE, GFP_KERNEL);
++		skb = alloc_skb(ATH12K_DS_BUFFER_SIZE + ATH12K_DS_HEADROOM +
++				DP_RX_BUFFER_ALIGN_SIZE, GFP_KERNEL);
 +		if (!skb)
 +			return -ENOMEM;
-+		skb_reserve(skb, PTR_ALIGN(skb->data, DP_RX_BUFFER_ALIGN_SIZE) - skb->data);
++		/* keep the headroom nss-dp expects in front of the payload */
++		skb_reserve(skb, PTR_ALIGN(skb->data, DP_RX_BUFFER_ALIGN_SIZE) - skb->data +
++			    ATH12K_DS_HEADROOM);
 +		memset(skb->cb, 0, sizeof(skb->cb));
 +		paddr = dma_map_single(ds->dp->dev, skb->data,
 +				       ATH12K_DS_BUFFER_SIZE, DMA_BIDIRECTIONAL);

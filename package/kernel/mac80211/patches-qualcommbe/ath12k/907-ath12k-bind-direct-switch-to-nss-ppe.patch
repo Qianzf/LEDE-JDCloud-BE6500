@@ -49,7 +49,7 @@ as ppe_ds_wlan_ops.
  				    unsigned int count, unsigned int size)
  {
  	struct ath12k_ds *ds = priv;
-@@ -556,18 +562,235 @@
+@@ -556,18 +562,274 @@
  	return READ_ONCE(ds->hw1_pending);
  }
  
@@ -83,17 +83,34 @@ as ppe_ds_wlan_ops.
 +{
 +	struct ath12k_ds_buf_ref refs[ATH12K_DS_MAX_BATCH];
 +	struct ath12k_ds *ds = ath12k_ds_by_node(node);
-+	u32 i, n;
++	u32 n;
 +
 +	if (!ds || !elem || !num_req)
 +		return 0;
-+	if (num_req > ARRAY_SIZE(refs))
-+		num_req = ARRAY_SIZE(refs);
-+	n = ath12k_ds_refill(ds, refs, num_req, buff_size);
-+	for (i = 0; i < n; i++) {
-+		elem[i].buff_addr = refs[i].addr;
-+		elem[i].opaque_lo = lower_32_bits(refs[i].cookie);
-+		elem[i].opaque_hi = upper_32_bits(refs[i].cookie);
++	if (headroom > ATH12K_DS_HEADROOM) {
++		if (!ds->headroom_warned) {
++			ds->headroom_warned = true;
++			ath12k_warn(ds->dp->ab,
++				    "DS headroom %u exceeds the reserved %u bytes\n",
++				    headroom, ATH12K_DS_HEADROOM);
++		}
++		return 0;
++	}
++	/* nss-dp may ask for more than one batch at a time. */
++	n = 0;
++	while (n < num_req) {
++		u32 chunk = min_t(u32, num_req - n, ARRAY_SIZE(refs));
++		u32 got = ath12k_ds_refill(ds, refs, chunk, buff_size);
++		u32 i;
++
++		for (i = 0; i < got; i++) {
++			elem[n + i].buff_addr = refs[i].addr;
++			elem[n + i].opaque_lo = lower_32_bits(refs[i].cookie);
++			elem[n + i].opaque_hi = upper_32_bits(refs[i].cookie);
++		}
++		n += got;
++		if (got < chunk)
++			break;
 +	}
 +
 +	return n;
@@ -200,6 +217,7 @@ as ppe_ds_wlan_ops.
 +	struct ppe_ds_wlan_arch_reg_info info = {};
 +	struct ppe_ds *node;
 +	u32 id;
++	int ret;
 +
 +	node = ppe_ds_wlan_inst_alloc((struct ppe_ds_wlan_ops *)&ath12k_ds_wlan_ops, 0);
 +	if (!node)
@@ -224,6 +242,17 @@ as ppe_ds_wlan_ops.
 +		return ERR_PTR(-EIO);
 +	}
 +
++	/* nss-ppe reports where the PPE side starts in each ring; the WMAC rings
++	 * must start at the same index or both sides desynchronise immediately.
++	 */
++	ret = ath12k_ds_start_indices(ds, info.wifi7_cfg.ppe2tcl_start_idx,
++				      info.wifi7_cfg.reo2ppe_start_idx);
++	if (ret) {
++		ath12k_ds_node_map[id] = NULL;
++		ppe_ds_wlan_inst_free(node);
++		return ERR_PTR(ret);
++	}
++
 +	return node;
 +}
 +
@@ -244,16 +273,26 @@ as ppe_ds_wlan_ops.
 +
 +static int ath12k_ds_nss_start(struct ath12k_ds *ds)
 +{
++	int ret;
++
 +	if (!ds->handle)
 +		return -ENODEV;
 +
-+	return ppe_ds_wlan_instance_start(ds->handle, &ds->ctx);
++	ret = ppe_ds_wlan_instance_start(ds->handle, &ds->ctx);
++	if (ret)
++		return ret;
++	/* Clear EDMA_PPEDS_SERVICE_STOP_BIT so the ppeds service runs. */
++	ppe_ds_wlan_service_status_update(ds->handle, false);
++
++	return 0;
 +}
 +
 +static int ath12k_ds_nss_stop(struct ath12k_ds *ds)
 +{
 +	if (!ds->handle)
 +		return -ENODEV;
++	/* Ask the EDMA side to stop servicing this node first. */
++	ppe_ds_wlan_service_status_update(ds->handle, true);
 +	ppe_ds_wlan_instance_stop(ds->handle, &ds->ctx);
 +
 +	return 0;
@@ -295,7 +334,7 @@ as ppe_ds_wlan_ops.
  static int ath12k_ds_stats_show(struct seq_file *seq, void *unused)
  {
  	struct ath12k_ds *ds = seq->private;
-@@ -858,11 +1081,8 @@
+@@ -858,11 +1081,11 @@
  		dev_put(dev);
  	}
  	ath12k_ds_flush_rx(ds);
@@ -304,8 +343,11 @@ as ppe_ds_wlan_ops.
 -		if (completed)
 -			qcom_ppe_ds_refill_ready(ds->handle);
 -	}
-+	if (completed && ds->handle && !READ_ONCE(ds->faulted))
-+		ppe_ds_wlan_service_status_update(ds->handle, true);
++	/* nss-ppe drives the indices itself; do not toggle the EDMA ppeds
++	 * service here.  service_status_update(handle, true) sets the EDMA
++	 * EDMA_PPEDS_SERVICE_STOP_BIT, i.e. it *stops* the service.
++	 */
++	(void)completed;
  	if (READ_ONCE(ds->faulted))
  		ath12k_ds_fault(ds);
  	return (done + 3) >> 2;
