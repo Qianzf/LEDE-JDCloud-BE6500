@@ -1,0 +1,1945 @@
+From: ViKing <viking.yfy@qq.com>
+Subject: [PATCH] wifi: ath12k: bind Direct Switch to the QSDK NSS/PPE stack
+
+The PPE side (qca-nss-ppe + qca-nss-dp) owns the Direct Switch rings, so
+ath12k no longer needs its own kernel transport.  Replace the qcom_ppe_ds_*
+calls with the exported ppe_ds_wlan_* API and hand the ring callback set over
+as ppe_ds_wlan_ops.
+
+- nss/: verbatim copies of the public nss-ppe headers, so the ABI cannot drift
+- ppe_ds.c: node id -> ds lookup for the callbacks, ppe_ds_wlan_* for
+  instance handling, ppe_vp_alloc()/ppe_vp_cfg_update() for VP routing
+- allow IPQ5332: the rings are host memory on the WMAC side and the PPE side
+  drives them, so the QCN9274-only gate is no longer meaningful
+- ath-qualcommbe.mk: kmod-ath12k depends on kmod-qca-nss-ppe-ds/-vp
+
+--- a/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/ppe_ds.c
+@@ -14,7 +14,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/seq_file.h>
+ #include <linux/unaligned.h>
+-#include <linux/soc/qcom/ppe-ds.h>
++#include "../nss/ppe_ds_wlan.h"
+ 
+ #include "../core.h"
+ #include "../debug.h"
+@@ -95,7 +95,8 @@
+ struct ath12k_ds {
+ 	atomic64_t control_rx;
+ 	struct ath12k_dp *dp;
+-	struct qcom_ppe_ds *handle;
++	struct ppe_ds *handle;
++	struct ppe_ds_wlan_ctx_info_handle ctx;
+ 	struct dp_srng tcl, reo, complete;
+ 	struct ath12k_ds_buffer *buffers;
+ 	/* Serialize refill and WLAN TX completion access to the buffer pool. */
+@@ -238,8 +239,13 @@
+ 	spin_unlock_irqrestore(&srng->lock, flags);
+ }
+ 
++struct ath12k_ds_buf_ref {
++	dma_addr_t addr;
++	u64 cookie;
++};
++
+ static unsigned int ath12k_ds_refill(void *priv,
+-				    struct qcom_ppe_ds_buffer *out,
++				    struct ath12k_ds_buf_ref *out,
+ 				    unsigned int count, unsigned int size)
+ {
+ 	struct ath12k_ds *ds = priv;
+@@ -556,18 +562,235 @@
+ 	return READ_ONCE(ds->hw1_pending);
+ }
+ 
+-static const struct qcom_ppe_ds_ops ath12k_ds_ops = {
+-	.more_reo = ath12k_ds_more_reo,
+-	.set_start_indices = ath12k_ds_start_indices,
+-	.get_tcl_cons = ath12k_ds_tcl_cons,
+-	.set_tcl_prod = ath12k_ds_tcl_prod,
+-	.get_reo_prod = ath12k_ds_reo_prod,
+-	.set_reo_cons = ath12k_ds_reo_cons,
+-	.refill = ath12k_ds_refill,
+-	.release = ath12k_ds_release,
+-	.fault = ath12k_ds_transport_fault,
++#define ATH12K_DS_MAX_NODES	4
++#define ATH12K_DS_MAX_BATCH	32
++
++/* nss-ppe hands us a node id; the callbacks below only get that id back. */
++static struct ath12k_ds *ath12k_ds_node_map[ATH12K_DS_MAX_NODES];
++
++static struct ath12k_ds *ath12k_ds_by_node(int node)
++{
++	if (node < 0 || node >= ATH12K_DS_MAX_NODES)
++		return NULL;
++
++	return ath12k_ds_node_map[node];
++}
++
++static u32 ath12k_ds_get_tx_desc_many(int node,
++				      struct ppe_ds_wlan_txdesc_elem *elem,
++				      u32 num_req, u32 buff_size, u32 headroom)
++{
++	struct ath12k_ds_buf_ref refs[ATH12K_DS_MAX_BATCH];
++	struct ath12k_ds *ds = ath12k_ds_by_node(node);
++	u32 i, n;
++
++	if (!ds || !elem || !num_req)
++		return 0;
++	if (num_req > ARRAY_SIZE(refs))
++		num_req = ARRAY_SIZE(refs);
++	n = ath12k_ds_refill(ds, refs, num_req, buff_size);
++	for (i = 0; i < n; i++) {
++		elem[i].buff_addr = refs[i].addr;
++		elem[i].opaque_lo = lower_32_bits(refs[i].cookie);
++		elem[i].opaque_hi = upper_32_bits(refs[i].cookie);
++	}
++
++	return n;
++}
++
++static void ath12k_ds_release_tx_desc_single(int node, u32 cookie)
++{
++	struct ath12k_ds *ds = ath12k_ds_by_node(node);
++	u64 full = cookie;
++
++	if (ds)
++		ath12k_ds_release(ds, &full, 1);
++}
++
++static void ath12k_ds_set_tcl_prod_idx(int node, u16 index)
++{
++	struct ath12k_ds *ds = ath12k_ds_by_node(node);
++
++	if (ds)
++		ath12k_ds_tcl_prod(ds, index);
++}
++
++static u16 ath12k_ds_get_tcl_cons_idx(int node)
++{
++	struct ath12k_ds *ds = ath12k_ds_by_node(node);
++
++	return ds ? ath12k_ds_tcl_cons(ds) : 0;
++}
++
++static void ath12k_ds_set_reo_cons_idx(int node, u16 index)
++{
++	struct ath12k_ds *ds = ath12k_ds_by_node(node);
++
++	if (ds)
++		ath12k_ds_reo_cons(ds, index);
++}
++
++static u16 ath12k_ds_get_reo_prod_idx(int node)
++{
++	struct ath12k_ds *ds = ath12k_ds_by_node(node);
++
++	return ds ? ath12k_ds_reo_prod(ds) : 0;
++}
++
++static void ath12k_ds_release_rx_desc(int node,
++				      struct ppe_ds_wlan_rxdesc_elem *arr,
++				      u16 count)
++{
++	struct ath12k_ds *ds = ath12k_ds_by_node(node);
++	u64 cookies[ATH12K_DS_MAX_BATCH];
++	u16 done = 0;
++
++	if (!ds)
++		return;
++	while (done < count) {
++		u16 i, batch = min_t(u16, count - done, ATH12K_DS_MAX_BATCH);
++
++		for (i = 0; i < batch; i++)
++			cookies[i] = arr[done + i].cookie;
++		ath12k_ds_release(ds, cookies, batch);
++		done += batch;
++	}
++}
++
++static void ath12k_ds_enable_tx_consume_intr(int node, bool enable)
++{
++}
++
++static void ath12k_ds_notify_napi_done(int node)
++{
++}
++
++static u8 ath12k_ds_get_wlan_arch_mode(void)
++{
++	return 7;
++}
++
++static const struct ppe_ds_wlan_ops ath12k_ds_wlan_ops = {
++	.get_tx_desc_many = ath12k_ds_get_tx_desc_many,
++	.release_tx_desc_single = ath12k_ds_release_tx_desc_single,
++	.set_tcl_prod_idx = ath12k_ds_set_tcl_prod_idx,
++	.set_reo_cons_idx = ath12k_ds_set_reo_cons_idx,
++	.get_tcl_cons_idx = ath12k_ds_get_tcl_cons_idx,
++	.get_reo_prod_idx = ath12k_ds_get_reo_prod_idx,
++	.release_rx_desc = ath12k_ds_release_rx_desc,
++	.enable_tx_consume_intr = ath12k_ds_enable_tx_consume_intr,
++	.notify_napi_done = ath12k_ds_notify_napi_done,
++	.get_wlan_arch_mode = ath12k_ds_get_wlan_arch_mode,
+ };
+ 
++static bool ath12k_ds_available(void)
++{
++	return true;
++}
++
++static void ath12k_ds_nss_sync(struct ath12k_ds *ds)
++{
++}
++
++static struct ppe_ds *
++ath12k_ds_nss_register(struct ath12k_ds *ds, ppe_ds_wlan_node_type_t node_type,
++		       dma_addr_t tcl, dma_addr_t reo, u32 count)
++{
++	struct ppe_ds_wlan_arch_reg_info info = {};
++	struct ppe_ds *node;
++	u32 id;
++
++	node = ppe_ds_wlan_inst_alloc((struct ppe_ds_wlan_ops *)&ath12k_ds_wlan_ops, 0);
++	if (!node)
++		return ERR_PTR(-ENODEV);
++	id = ppe_ds_get_node_id(node);
++	if (id >= ATH12K_DS_MAX_NODES) {
++		ppe_ds_wlan_inst_free(node);
++		return ERR_PTR(-ENOSPC);
++	}
++	ath12k_ds_node_map[id] = ds;
++
++	info.node_type = node_type;
++	info.dp_ppeds_node_id = id;
++	info.wifi_arch_mode = ath12k_ds_get_wlan_arch_mode();
++	info.wifi7_cfg.ppe2tcl_ba = tcl;
++	info.wifi7_cfg.reo2ppe_ba = reo;
++	info.wifi7_cfg.ppe2tcl_num_desc = count;
++	info.wifi7_cfg.reo2ppe_num_desc = count;
++	if (!ppe_ds_wlan_inst_register_arch_mode_wifi7(node, &info)) {
++		ath12k_ds_node_map[id] = NULL;
++		ppe_ds_wlan_inst_free(node);
++		return ERR_PTR(-EIO);
++	}
++
++	return node;
++}
++
++static int ath12k_ds_nss_unregister(struct ath12k_ds *ds)
++{
++	u32 id;
++
++	if (!ds->handle)
++		return 0;
++	id = ppe_ds_get_node_id(ds->handle);
++	if (id < ATH12K_DS_MAX_NODES)
++		ath12k_ds_node_map[id] = NULL;
++	ppe_ds_wlan_inst_free(ds->handle);
++	ds->handle = NULL;
++
++	return 0;
++}
++
++static int ath12k_ds_nss_start(struct ath12k_ds *ds)
++{
++	if (!ds->handle)
++		return -ENODEV;
++
++	return ppe_ds_wlan_instance_start(ds->handle, &ds->ctx);
++}
++
++static int ath12k_ds_nss_stop(struct ath12k_ds *ds)
++{
++	if (!ds->handle)
++		return -ENODEV;
++	ppe_ds_wlan_instance_stop(ds->handle, &ds->ctx);
++
++	return 0;
++}
++
++static int ath12k_ds_nss_vp_alloc(struct ath12k_ds *ds, struct net_device *dev)
++{
++	struct ppe_vp_ai vpai = {};
++
++	vpai.usr_type = PPE_VP_USER_TYPE_DS;
++	vpai.net_dev_type = PPE_VP_NET_DEV_TYPE_WIFI;
++	vpai.status = PPE_VP_STATUS_SUCCESS;
++	/* ppe_ds_wlan_vp_alloc() would need the internal ppe_ds_wlan_handle_t;
++	 * ppe_vp_alloc() is the same path and is exported directly.
++	 */
++	return ppe_vp_alloc(dev, &vpai);
++}
++
++static int ath12k_ds_nss_vp_route(struct ath12k_ds *ds, int port, bool direct)
++{
++	struct ppe_vp_ui ui = {};
++
++	if (port < 0)
++		return -ENODEV;
++	ui.usr_type = direct ? PPE_VP_USER_TYPE_DS : PPE_VP_USER_TYPE_NONE;
++	ui.update_flags = PPE_VP_UPDATE_FLAG_VP_USR_TYPE;
++
++	return ppe_vp_cfg_update(port, &ui);
++}
++
++static int ath12k_ds_nss_vp_free(struct ath12k_ds *ds, int port)
++{
++	if (port < 0)
++		return 0;
++
++	return ppe_vp_free(port);
++}
++
+ static int ath12k_ds_stats_show(struct seq_file *seq, void *unused)
+ {
+ 	struct ath12k_ds *ds = seq->private;
+@@ -858,11 +1081,8 @@
+ 		dev_put(dev);
+ 	}
+ 	ath12k_ds_flush_rx(ds);
+-	if (ds->handle && !READ_ONCE(ds->faulted)) {
+-		qcom_ppe_ds_sync(ds->handle);
+-		if (completed)
+-			qcom_ppe_ds_refill_ready(ds->handle);
+-	}
++	if (completed && ds->handle && !READ_ONCE(ds->faulted))
++		ppe_ds_wlan_service_status_update(ds->handle, true);
+ 	if (READ_ONCE(ds->faulted))
+ 		ath12k_ds_fault(ds);
+ 	return (done + 3) >> 2;
+@@ -902,7 +1122,7 @@
+ 	val &= ~GENMASK(31, HAL_TCL_DS_RBM_MAPPING_SHIFT);
+ 	val |= (u32)HAL_WBM2SW_DS_RBM_ID << HAL_TCL_DS_RBM_MAPPING_SHIFT;
+ 	ath12k_hif_write32(ab, reg, val);
+-	ret = qcom_ppe_ds_start(ds->handle);
++	ret = ath12k_ds_nss_start(ds);
+ 	if (!ret)
+ 		ds->started = true;
+ 	else
+@@ -992,7 +1212,7 @@
+ 	bank = ath12k_dp_tx_get_bank_config(ds->dp, bank_config);
+ 	if (bank < 0)
+ 		return -ENOSPC;
+-	port = qcom_ppe_ds_vp_alloc(ds->handle, wdev->netdev);
++	port = ath12k_ds_nss_vp_alloc(ds, wdev->netdev);
+ 	if (port < 0) {
+ 		ath12k_dp_tx_put_bank_profile(ds->dp, bank);
+ 		return port;
+@@ -1039,7 +1259,7 @@
+ 			continue;
+ 		if (direct && (vp->closing || ds->stopped || ds->faulted))
+ 			return -ESHUTDOWN;
+-		ret = qcom_ppe_ds_vp_route(ds->handle, vp->port, direct);
++		ret = ath12k_ds_nss_vp_route(ds, vp->port, direct);
+ 		if (ret) {
+ 			ath12k_ds_fault(ds);
+ 			return ret;
+@@ -1335,9 +1555,9 @@
+ 			if (before) {
+ 				ath12k_ds_control_unregister(vp);
+ 				vp->closing = true;
+-				ret = qcom_ppe_ds_vp_route(ds->handle, vp->port, false);
++				ret = ath12k_ds_nss_vp_route(ds, vp->port, false);
+ 				for (retry = 0; !ret && retry < 200; retry++) {
+-					qcom_ppe_ds_sync(ds->handle);
++					ath12k_ds_nss_sync(ds);
+ 					if (ath12k_ds_tcl_cons(ds) ==
+ 					    ath12k_ds_srng(ds, &ds->tcl)->u.src_ring.hp /
+ 					    ath12k_ds_srng(ds, &ds->tcl)->entry_size) {
+@@ -1362,7 +1582,7 @@
+ 					continue;
+ 				ath12k_hif_write32(dp->ab, ATH12K_DS_VP_TABLE + i * 4, 0);
+ 				ath12k_hif_read32(dp->ab, ATH12K_DS_VP_TABLE + i * 4);
+-				ret = qcom_ppe_ds_vp_free(ds->handle, vp->port);
++				ret = ath12k_ds_nss_vp_free(ds, vp->port);
+ 				if (ret) {
+ 					fault = true;
+ 					continue;
+@@ -1398,7 +1618,7 @@
+ 	}
+ 	for (i = 0; i < ATH12K_DS_VP_COUNT; i++)
+ 		if (ds->vps[i].reserved) {
+-			err = qcom_ppe_ds_vp_route(ds->handle, ds->vps[i].port, false);
++			err = ath12k_ds_nss_vp_route(ds, ds->vps[i].port, false);
+ 			if (err)
+ 				ath12k_warn(dp->ab,
+ 					    "DS VP CPU route failed: %d; stop will retry\n", err);
+@@ -1413,11 +1633,9 @@
+ 		ath12k_wifi7_hal_ds_disable(dp->ab, ath12k_ds_srng(ds, &ds->reo));
+ 		/* Observe the final DMA head writeback before EDMA drains. */
+ 		usleep_range(1000, 2000);
+-		if (ds->handle)
+-			qcom_ppe_ds_sync(ds->handle);
+ 	}
+ 	if (ds->handle)
+-		ret = qcom_ppe_ds_stop(ds->handle);
++		ret = ath12k_ds_nss_stop(ds);
+ 	if (ds->tcl_ready)
+ 		ath12k_wifi7_hal_ds_disable(dp->ab, ath12k_ds_srng(ds, &ds->tcl));
+ 	if (!ret)
+@@ -1462,8 +1680,6 @@
+ 	if (!ds)
+ 		return;
+ 	mutex_lock(&ds->control_lock);
+-	if (ds->handle)
+-		qcom_ppe_ds_detach(ds->handle);
+ 	WRITE_ONCE(ds->faulted, true);
+ 	WRITE_ONCE(ds->quarantined, true);
+ 	mutex_unlock(&ds->control_lock);
+@@ -1486,7 +1702,7 @@
+ 	if (ds->quarantined)
+ 		goto quarantine;
+ 	if (ds->handle) {
+-		ret = qcom_ppe_ds_unregister(ds->handle);
++		ret = ath12k_ds_nss_unregister(ds);
+ 		if (ret) {
+ 			ath12k_dp_ds_quarantine_group(dp->ab->ag);
+ 			ath12k_wifi7_ds_quarantine(dp);
+@@ -1541,15 +1757,21 @@
+ 
+ int ath12k_wifi7_ds_setup(struct ath12k_dp *dp)
+ {
+-	struct qcom_ppe_ds_config config = {};
+ 	struct ath12k_ds *ds;
++	ppe_ds_wlan_node_type_t node_type;
+ 	int ret, i;
+ 
+-	if (!qcom_ppe_ds_available())
++	if (!ath12k_ds_available())
+ 		return 0;
+ 	if (dp->ab->hw_rev != ATH12K_HW_QCN9274_HW10 &&
+-	    dp->ab->hw_rev != ATH12K_HW_QCN9274_HW20)
++	    dp->ab->hw_rev != ATH12K_HW_QCN9274_HW20 &&
++	    dp->ab->hw_rev != ATH12K_HW_IPQ5332_HW10)
+ 		return 0;
++	/* The PPE side owns the DS rings, so the WMAC firmware revision no longer
++	 * decides whether Direct Switch is possible; only the band does.
++	 */
++	node_type = dp->ab->hif.bus == ATH12K_BUS_AHB ?
++		    PPE_DS_NODE_TYPE_2G : PPE_DS_NODE_TYPE_5G;
+ 	/* Unknown HW1 firmware and raw RX keep the ordinary CPU datapath. */
+ 	if (dp->ab->hw_rev == ATH12K_HW_QCN9274_HW10 &&
+ 	    (!ath12k_wifi7_ds_hw1_compat(dp->ab) ||
+@@ -1591,15 +1813,10 @@
+ 	if (ret)
+ 		goto fail;
+ 	ds->complete_ready = true;
+-	config.wlan_dev = dp->dev;
+-	config.ops = &ath12k_ds_ops;
+-	config.priv = ds;
+-	config.ppe2tcl = ath12k_ds_srng(ds, &ds->tcl)->ring_base_paddr;
+-	config.reo2ppe = ath12k_ds_srng(ds, &ds->reo)->ring_base_paddr;
+-	config.ppe2tcl_count = ATH12K_DS_RING_ENTRIES;
+-	config.reo2ppe_count = ATH12K_DS_RING_ENTRIES;
+-	config.buffer_size = ATH12K_DS_BUFFER_SIZE;
+-	ds->handle = qcom_ppe_ds_register(&config);
++	ds->handle = ath12k_ds_nss_register(ds, node_type,
++					    ath12k_ds_srng(ds, &ds->tcl)->ring_base_paddr,
++					    ath12k_ds_srng(ds, &ds->reo)->ring_base_paddr,
++					    ATH12K_DS_RING_ENTRIES);
+ 	if (IS_ERR(ds->handle)) {
+ 		ret = PTR_ERR(ds->handle);
+ 		ds->handle = NULL;
+--- a/drivers/net/wireless/ath/ath12k/nss/ppe_drv_port.h
++++ b/drivers/net/wireless/ath/ath12k/nss/ppe_drv_port.h
+@@ -0,0 +1,331 @@
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++/**
++ * @file ppe_drv_port.h
++ *	NSS PPE driver definitions.
++ */
++#ifndef _PPE_DRV_PORT_H_
++#define _PPE_DRV_PORT_H_
++
++#include <linux/netdevice.h>
++
++/*
++ * PPE port defines
++ */
++#define PPE_DRV_PHYSICAL_START		0	/* Physical port start with port 0 */
++#define PPE_DRV_PHYSICAL_MAX		8	/* PPE supports 8 physical ports 0-7 */
++#define PPE_DRV_VIRTUAL_MAX		192	/* PPE supports 192 virtual interfaces 64-255 */
++#define PPE_DRV_VIRTUAL_START		64	/* Virtual ports start at 64 */
++#define PPE_DRV_VIRTUAL_END		(PPE_DRV_VIRTUAL_START + PPE_DRV_VIRTUAL_MAX)
++						/* Virtual ports ends at 256 */
++#define PPE_DRV_PORTS_MAX		256	/* Total ports in PPE Physical + Trunk + Virtual */
++
++#define PPE_DRV_PORT_ID_INVALID		-1	/* Invalid port ID */
++
++#define PPE_DRV_PORT_CPU		0	/* PPE egress port to reach CPUs */
++#define PPE_DRV_PORT_EIP197		7	/* PPE egress port to reach EIP197 */
++
++#define PPE_DRV_PORT_JUMBO_MAX		9216	/* Suggested value is 9K, but can be increased upto 10K */
++
++#define PPE_DRV_PHY_ETH_PORT_START	1	/* Physical eth port start with port 1 */
++#ifdef NSS_PPE_IPQ53XX
++#define PPE_DRV_PHY_ETH_PORT_MAX	2	/* PPE supports 2 physical ports 1-2 for IPQ53XX */
++#elif defined(NSS_PPE_IPQ54XX)
++#define PPE_DRV_PHY_ETH_PORT_MAX	3	/* PPE supports 3 physical ports 1-3 for IPQ54XX */
++#else
++#define PPE_DRV_PHY_ETH_PORT_MAX	6	/* PPE supports 6 physical ports 1-6 for Others */
++#endif
++#define PPE_DRV_GET_VP_IDX(dvp) ((dvp) - PPE_DRV_VIRTUAL_START)
++
++typedef int32_t ppe_drv_port_t;
++
++struct ppe_drv;
++struct ppe_drv_vsi;
++struct ppe_drv_l3_if;
++
++/*
++ * ppe_drv_port_hw_stats
++ *	PPE port Hardware statistics.
++ */
++struct ppe_drv_port_hw_stats {
++	uint32_t rx_pkt_cnt;	/* rx packet counter */
++	uint32_t rx_drop_pkt_cnt;	/* rx drop packet counter */
++	uint32_t tx_pkt_cnt;	/* tx packet counter */
++	uint32_t tx_drop_pkt_cnt;	/* tx drop packet counter */
++	uint64_t rx_byte_cnt;	/* rx byte counter */
++	uint64_t rx_drop_byte_cnt;	/* rx drop byte counter */
++	uint64_t tx_byte_cnt;	/* tx byte counter */
++	uint64_t tx_drop_byte_cnt;	/* tx drop byte counter */
++};
++
++/*
++ * ppe_drv_port_type
++ *	PPE Port types - values derived from HW spec
++ */
++enum ppe_drv_port_type {
++	PPE_DRV_PORT_PHYSICAL,		/* Physical Port */
++	PPE_DRV_PORT_LAG,		/* LAG Port */
++	PPE_DRV_PORT_VIRTUAL,		/* Virtual Port */
++	PPE_DRV_PORT_EIP,		/* EIP inline Port */
++	PPE_DRV_PORT_VIRTUAL_PO,	/* Virtual point offload port */
++	PPE_DRV_PORT_ENQ_VP,		/* Enqueue VPort */
++	PPE_DRV_PORT_CPU_TYPE,		/* CPU Port */
++	PPE_DRV_PORT_VIRTUAL_GW,	/* Gateway Virtual Port */
++	PPE_DRV_PORT_VIRTUAL_PON,	/* PON  Virtual Port */
++};
++
++/*
++ * ppe_drv_port_qos_res_pre
++ *	PPE Port QOS resolution precedence
++ *
++ * QOS resolution precedence across different classfication engines
++ * This ranges from 0-7, 0,7 are reserved.
++ */
++enum ppe_drv_port_qos_res_pre {
++	PPE_DRV_PORT_QOS_RES_PREC_0_RESERVED,
++	PPE_DRV_PORT_QOS_RES_PREC_1,
++	PPE_DRV_PORT_QOS_RES_PREC_2,
++	PPE_DRV_PORT_QOS_RES_PREC_3,
++	PPE_DRV_PORT_QOS_RES_PREC_4,
++	PPE_DRV_PORT_QOS_RES_PREC_5,
++	PPE_DRV_PORT_QOS_RES_PREC_6,
++	PPE_DRV_PORT_QOS_RES_PREC_7,
++};
++
++/*
++ * ppe_drv_enq_vp_type
++ *	PPE enq_vp type
++ */
++enum ppe_drv_enq_vp_type {
++	PPE_DRV_ENQ_VP_DEFAULT,		/* Used for DS and other purpose */
++#ifdef NSS_PPE_PON_SUPPORT
++	PPE_DRV_ENQ_VP_PON,		/* Used for PON cases */
++	PPE_DRV_BASEQ_ENQ_VP_PON,	/* Used for mapoing base queue for PON cases */
++#endif
++};
++
++/**
++ * ppe_drv_port_get_vp_phys_dev
++ *	Get physical dev attached to VP.
++ *
++ * @datatypes
++ * net_device
++ *
++ * @param[in] dev  Net device.
++ *
++ * @return
++ *  return net device
++ */
++struct net_device *ppe_drv_port_get_vp_phys_dev(struct net_device *dev);
++
++/**
++ * ppe_drv_port_ucast_queue_get_by_port
++ *	Return queue id of port number.
++ *
++ * @datatypes
++ * int
++ *
++ * @return
++ * -1 for failure else port ID
++ */
++int32_t ppe_drv_port_ucast_queue_get_by_port(int port);
++
++/**
++ * ppe_drv_port_num_from_dev
++ *	Get port index from device.
++ *
++ * @datatypes
++ * net_device
++ *
++ * @param[in] dev  Net device.
++ *
++ * @return
++ * -1 for failure else port_index.
++ */
++int32_t ppe_drv_port_num_from_dev(struct net_device *dev);
++
++/**
++ * ppe_drv_port_num_to_dev
++ *	Port number to device.
++ *
++ * @param[in] port  Port number.
++ *
++ * @return
++ * net_device.
++ */
++struct net_device *ppe_drv_port_num_to_dev(uint8_t port);
++
++/**
++ * ppe_drv_port_xcpn_mode_set
++ *	Set exception mode.
++ *
++ * @param[in] port number, action.
++ *
++ * @return
++ * 1 for success, 0 for failure.
++ */
++bool ppe_drv_port_xcpn_mode_set(uint16_t vp_num, uint8_t action);
++
++/**
++ * ppe_drv_port_get_vp_stats
++ * 	Get PPE hardware stats for the VP port.
++ *
++ * @datatypes
++ * ppe_drv_port_hw_stats
++ *
++ * @param[in] port PPE port number.
++ * @param[in,out] vp_stats VP hardware stats.
++ *
++ * @return
++ * True if the hw stats are copied, false otherwise.
++ */
++bool ppe_drv_port_get_vp_stats(int16_t port, struct ppe_drv_port_hw_stats *vp_stats);
++
++/*
++ * ppe_drv_port_clear_policer_support
++ *	Clear Policer enabled on Port.
++ *
++ * @param[in] dev  Netdevie.
++ *
++ * @return
++ */
++void ppe_drv_port_clear_policer_support(struct net_device *dev);
++
++/*
++ * ppe_drv_port_set_policer_support
++ *	Set Policer enabled on Port.
++ *
++ * @param[in] dev  Netdevie.
++ *
++ * @return
++ */
++void ppe_drv_port_set_policer_support(struct net_device *dev);
++
++/*
++ * ppe_drv_port_check_policer_support
++ *	Is Policer enabled on Port.
++ *
++ * @param[in] dev  Netdevie.
++ *
++ * @return
++ * True or False.
++ */
++bool ppe_drv_port_check_policer_support(struct net_device *dev);
++
++/*
++ * ppe_drv_port_check_rfs_support
++ *	Is RFS enabled on Port.
++ *
++ * @param[in] dev  Netdevie.
++ *
++ * @return
++ * True or False.
++ */
++bool ppe_drv_port_check_rfs_support(struct net_device *dev);
++
++/**
++ * ppe_drv_port_clear_hw_vp_stats
++ * 	Clear PPE HW stats for the VP.
++ *
++ * @param[in] port PPE port number.
++ *
++ * @return
++ * True if the hw stats are cleared, false otherwise.
++ */
++bool ppe_drv_port_clear_hw_vp_stats(int16_t port);
++
++/**
++ * ppe_drv_port_ucast_queue_profile_get
++ * 	Get pri profile for the unicast queue
++ *
++ * @param[in] port
++ *
++ * @return
++ * pri profile.
++ */
++int32_t ppe_drv_port_ucast_queue_profile_get(int port);
++
++/**
++ * ppe_drv_port_metadata_to_pri_prof
++ * 	Get enqueue vport pri profile
++ *
++ * @param[in] port metadata
++ *
++ * @return
++ * pri profile.
++ */
++int16_t ppe_drv_port_metadata_to_pri_prof(uint8_t port_metadata);
++
++/**
++ * ppe_drv_port_metadata_to_enq_vp
++ * 	Get enqueue vport from metadata
++ *
++ * @param[in] port metadata
++ *
++ * @return
++ * Enqueue vp.
++ */
++int16_t ppe_drv_port_metadata_to_enq_vp(uint8_t port_metadata);
++
++/**
++ * ppe_drv_port_phy_rfs_clear
++ *	Clears RFS enable flag for physical ports.
++ *
++ * @param[in]	none.
++ *
++ * @return
++ * none.
++ */
++void ppe_drv_port_phy_rfs_clear(void);
++
++/**
++ * ppe_drv_port_phy_rfs_set
++ *	Sets RFS enable flag for physical ports.
++ *
++ * @param[in]	none.
++ *
++ * @return
++ * none.
++ */
++void ppe_drv_port_phy_rfs_set(void);
++
++/*
++ * ppe_drv_port_is_gem()
++ *      Check whether the given port number corresponds to a GEM port.
++ *
++ * This helper is used to validate whether a port number belongs to
++ * the GEM range supported by the PPE driver.
++ *
++ * @param[in] port_num
++ *      Port number to be evaluated.
++ *
++ * @return
++ *      true  – The port is identified as a GEM port.
++ *      false – The port is not a GEM port.
++ */
++bool ppe_drv_port_is_gem(uint16_t port_num);
++
++/**
++ * ppe_drv_port_num_from_ifname
++ *	Get PPE port number from ifname
++ *
++ * @param[in]	ifname.
++ *
++ * @return
++ * PPE port number.
++ */
++int32_t ppe_drv_port_num_from_ifname(const char *ifname);
++
++/**
++ * ppe_drv_port_vlan_append_set
++ *	Set or clear asymmetric VLAN append flag on a port.
++ *
++ * @param[in] dev     Net device.
++ * @param[in] enable  True to enable, false to disable.
++ */
++void ppe_drv_port_vlan_append_set(struct net_device *dev, bool enable);
++
++#endif /* _PPE_DRV_PORT_H_ */
+--- a/drivers/net/wireless/ath/ath12k/nss/ppe_vp_public.h
++++ b/drivers/net/wireless/ath/ath12k/nss/ppe_vp_public.h
+@@ -0,0 +1,441 @@
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++/**
++ * @file ppe_vp_public.h
++ *	NSS PPE VP Public definitions.
++ */
++
++#ifndef _PPE_VP_PUBLIC_H_
++#define _PPE_VP_PUBLIC_H_
++
++#include <linux/module.h>
++#include <net/xdp.h>
++#include "ppe_drv_port.h"
++
++struct ppe_drv_iface;
++
++#define PPE_VP_FLAG_DISABLE_TTL_DEC	0x1	/**< Set = TTL Decrement disabled, clear = TTL Decrement enabled */
++#define PPE_VP_FLAG_REDIR_ENABLE	0x2	/**< When set, the packets destined to VP are redirect to VP queue without RPS */
++#define PPE_VP_FLAG_IPSEC_FULL_INLINE	0x4	/**< Set = IPSEC full inline is enabled, clear is IPsec full inline is not enabled */
++
++#define PPE_VP_DS_INVALID_NODE_ID	0xFF	/**< Invalid node id value */
++
++/**
++ * PPE VP field update flags.
++ */
++#define PPE_VP_UPDATE_FLAG_VP_CORE_MASK		0x1	/**< Flag to indicate core mask update */
++#define PPE_VP_UPDATE_FLAG_VP_USR_TYPE		0x2	/**< Flag to indicate user type update */
++#define PPE_VP_UPDATE_FLAG_VP_MPSK_EN		0x4	/**< Flag to indicate MPSK bit update */
++#define PPE_VP_UPDATE_FLAG_VP_SRC_CB		0x8	/**< Flag to indicate source cb update */
++#define PPE_VP_UPDATE_FLAG_VP_SRC_CB_DATA	0x10	/**< Flag to indicate source cb data update */
++#define PPE_VP_UPDATE_FLAG_INVALID		0xFF	/**< Flag to indicate invalid update */
++
++/**
++ * @addtogroup ppe_vp_public_subsystem
++ * @{
++ */
++
++/**
++ * ppe_vp_hw_stats_t
++ *	 PPE VP port statistics.
++ */
++typedef struct ppe_drv_port_hw_stats ppe_vp_hw_stats_t;
++
++/**
++ * ppe_vp_status
++ *	Types of PPE VP statuses.
++ */
++typedef enum ppe_vp_status {
++	PPE_VP_STATUS_SUCCESS = 0,	/**< VP Success */
++	PPE_VP_STATUS_INVALID_TYPE,	/**< VP Invalid */
++	PPE_VP_STATUS_PPEIFACE_ALLOC_FAIL,
++					/**< VP PPE iface alloc failed */
++	PPE_VP_STATUS_GET_VP_FAIL,	/**< VP PPE init failed */
++	PPE_VP_STATUS_MAC_CLEAR_FAIL,	/**< VP PPE init failed */
++	PPE_VP_STATUS_MAC_SET_FAIL,	/**< VP PPE init failed */
++	PPE_VP_STATUS_MTU_SET_FAIL,	/**< VP PPE init failed */
++	PPE_VP_STATUS_VP_INIT_FAIL,	/**< VP PPE init failed */
++	PPE_VP_STATUS_VP_DEINIT_FAIL,	/**< VP PPE init failed */
++	PPE_VP_STATUS_PORT_INVALID,	/**< VP PPE init failed */
++	PPE_VP_STATUS_VP_ALLOC_FAIL,	/**< VP alloc failed */
++	PPE_VP_STATUS_VP_FREE_FAIL,	/**< VP free  failed */
++	PPE_VP_STATUS_FAILURE,		/**< VP Failure */
++	PPE_VP_STATUS_VP_QUEUE_SET_FAILED,
++					/**< VP to Queue map failed */
++	PPE_VP_STATUS_HW_VP_STATS_CLEAR_FAILED,
++					/**< Failed to clear PPE VP hardware statistics */
++	PPE_VP_STATUS_UPDATE_FAIL,	/**< VP PPE update failed */
++	PPE_VP_STATUS_PORT_ALLOC_FAIL,	/**< PPE port alloc failed */
++	PPE_VP_STATUS_PORT_SET_FAIL,	/**< PPE port set failed */
++	PPE_VP_STATUS_PORT_LIST_ADD_FAIL,	/** PPE port addition to list failed */
++	PPE_VP_STATUS_PORT_LIST_GET_FAIL,	/** PPE port get failed from list */
++	PPE_VP_STATUS_PORT_LIST_DEL_FAIL,	/** PPE port deletion from list failed */
++	PPE_VP_STATUS_MAX,		/**< Maximum VP statuses */
++} ppe_vp_status_t;
++
++typedef int16_t ppe_vp_num_t;
++
++/*
++ * ppe_vp_cb_mdata_type
++ *	Metadata type
++ */
++enum ppe_vp_cb_mdata_type {
++	PPE_VP_CB_MDATA_TYPE_NONE = 0,		/**< No specific metadata */
++	PPE_VP_CB_MDATA_TYPE_HW_GRO = 1,	/**< HW GRO metadata */
++};
++
++/*
++ * ppe_vp_rx_hw_gro_bit
++ *      HW GRO flags in ppe_vp_cb_mdata_info.hw_gro_flags.
++ */
++enum ppe_vp_rx_hw_gro_bit {
++	PPE_VP_RX_HW_GRO_EN_BIT = 0,	/* HW GRO is enabled */
++	PPE_VP_RX_HW_GRO_MORE_BIT,	/* HW GRO more segments */
++	PPE_VP_RX_HW_GRO_TCP_FIN_BIT,	/* HW GRO fin segment */
++	PPE_VP_RX_HW_GRO_TCP_PSH_BIT,	/* HW GRO psh segment */
++	PPE_VP_RX_HW_GRO_MAX,
++};
++
++#define PPE_VP_RX_HW_GRO_EN		BIT(PPE_VP_RX_HW_GRO_EN_BIT)
++#define PPE_VP_RX_HW_GRO_MORE		BIT(PPE_VP_RX_HW_GRO_MORE_BIT)
++#define PPE_VP_RX_HW_GRO_TCP_FIN	BIT(PPE_VP_RX_HW_GRO_TCP_FIN_BIT)
++#define PPE_VP_RX_HW_GRO_TCP_PSH	BIT(PPE_VP_RX_HW_GRO_TCP_PSH_BIT)
++
++/*
++ * ppe_vp_cb_mdata_info
++ *	PPE VP metadata info
++ */
++struct ppe_vp_cb_mdata_info {
++	enum ppe_vp_cb_mdata_type mdata_type;	/**< Metadata type */
++	uint32_t hw_gro_flags;			/**< HW GRO flags (PPE_VP_RX_HW_GRO_*) */
++};
++
++/**
++ * ppe_vp_cb_info
++ *	Information for VP callback
++ *	to process exception packet.
++ */
++struct ppe_vp_cb_info {
++	uint8_t ip_summed;		/**< IP checksum */
++	bool fake_mac_present;		/** Fake MAC header present */
++	struct sk_buff *skb;		/**< skb */
++	struct napi_struct *napi;	/**< RX napi */
++	struct net_device *phys_dev;	/**< Physical dev for tunnel */
++	uint32_t flow_idx;		/**< Flow index of a packet */
++	struct ppe_vp_cb_mdata_info mdata_info;	/**< Metadata info */
++};
++
++/**
++ * ppe_vp_xdp_cb_info
++ *	Information for VP XDP callback to process XDP packets.
++ */
++struct ppe_vp_xdp_cb_info {
++	struct xdp_buff *xdp;		/**< Single XDP buffer payload */
++	struct xdp_buff **xdp_vec;	/**< Array of XDP buffers */
++	uint32_t total_bytes;		/**< Total payload bytes across all XDP buffers */
++	uint32_t flow_idx;		/**< Flow index of the packet */
++	struct ppe_vp_cb_mdata_info mdata_info;	/**< Metadata info (e.g. HW GRO) */
++};
++
++/**
++ * Callback function for VP Rx.
++ *
++ * @datatypes
++ * net_device
++ * sk_buff
++ *
++ * @param[in] ppe_vp_cb_info	Pointer to exception information.
++ * @param[in] cb_data		Pointer to the callback data.
++ */
++typedef bool(*ppe_vp_callback_t)(struct ppe_vp_cb_info *, void *cb_data);
++
++/**
++ * Callback function for VP XDP Rx.
++ *
++ * @param[in] ppe_vp_xdp_cb_info	Pointer to XDP callback information.
++ * @param[in] cb_data			Pointer to the callback data.
++ */
++typedef bool(*ppe_vp_xdp_callback_t)(struct ppe_vp_xdp_cb_info *, void *cb_data);
++
++/**
++ * Callback function for VP Rx list.
++ *
++ * @datatypes
++ * net_device
++ * sk_buff
++ *
++ * @param[in] net_device  	Pointer to the net device.
++ * @param[in] sk_buff_head	Pointer to the skb list head.
++ * @param[in] cb_data     	Pointer to the callback data.
++ */
++typedef bool(*ppe_vp_list_callback_t)(struct net_device *, struct sk_buff_head *, void *cb_data);
++
++/**
++ * ppe_vp_type
++ *	Types of VPs
++ */
++typedef enum ppe_vp_type {
++	PPE_VP_TYPE_SW_L2,		/**< VP type for L2 SW interfaces */
++	PPE_VP_TYPE_SW_L3,		/**< VP type for L3 SW interfaces */
++	PPE_VP_TYPE_SW_PO,		/**< VP type for point offload tunnels */
++	PPE_VP_TYPE_HW_L2TUN,		/**< VP type for L2 HW tunnels */
++	PPE_VP_TYPE_HW_L3TUN,		/**< VP type for L3 HW tunnels */
++	PPE_VP_TYPE_MAX,		/**< Maximum VP types */
++} ppe_vp_type_t;
++
++/**
++ * Callback function for VP HW port statistics.
++ *
++ * @datatypes
++ * net_device
++ * ppe_vp_hw_stats_t
++ *
++ * @param[in] net_device Pointer to the net device.
++ * @param[in,out] ppe_vp_hw_stats_t Pointer to PPE-VP HW stats structure.
++ */
++typedef bool(*ppe_vp_stats_callback_t)(struct net_device *, ppe_vp_hw_stats_t *);
++
++/*
++ * ppe_vp_user_type
++ *	Types of VPs user
++ */
++typedef enum ppe_vp_user_type {
++	PPE_VP_USER_TYPE_NONE = 0,	/**< Non VP use case >*/
++	PPE_VP_USER_TYPE_PASSIVE,	/**< VP for Passive use case */
++	PPE_VP_USER_TYPE_ACTIVE,	/**< VP for Active use case */
++	PPE_VP_USER_TYPE_DS,		/**< VP for Direct-Switch use case */
++	PPE_VP_USER_TYPE_MAX,		/**< Maximum VP User types */
++} ppe_vp_user_type_t;
++
++/*
++ * ppe_vp_netdev_type
++ *	Types of VP netdev
++ */
++enum ppe_vp_net_dev_type {
++	PPE_VP_NET_DEV_TYPE_WIFI = 1,	/**< VP netdev is of type Wi-Fi */
++	PPE_VP_NET_DEV_TYPE_NETFN_OL,	/**< NETFN netdev */
++	PPE_VP_NET_DEV_TYPE_MAX,		/**< Maximum VP netdev types */
++};
++
++/*
++ * ppe_vp_net_dev_pvt_flags
++ *	Flags of a netdev
++ */
++enum ppe_vp_net_dev_pvt_flags {
++	PPE_VP_NET_DEV_FLAG_IS_MLD = 1,	/**< Is MLD net dev */
++	PPE_VP_NET_DEV_FLAG_MAX,		/**< Maximum netdev flags */
++};
++
++/**
++ * ppe_vp_ui
++ *	Data structure for VP update information.
++ */
++struct ppe_vp_ui {
++	enum ppe_vp_user_type usr_type;	/**< VP user type */
++	void *src_cb;			/**< Source callback to be registered from VP owner */
++	void *cb_data;			/**< Callback data */
++	uint8_t mpsk_en;		/**< MPSK indication */
++	uint8_t core_mask;		/**< Updated Core to be used for a particular VP flow */
++	uint16_t update_flags;		/**< Flags to indicate the update fields */
++	ppe_vp_stats_callback_t stats_cb;		/**< Callback function for VP HW port statistics.*/
++};
++
++/**
++ * ppe_vp_ai
++ *	Data structure VP allocation.
++ */
++struct ppe_vp_ai {
++	ppe_vp_type_t type;		/**< VP type */
++	ppe_vp_callback_t dst_cb;	/**< VP dst callback */
++	ppe_vp_list_callback_t dst_list_cb;	/**< VP dst callback */
++	ppe_vp_xdp_callback_t dst_xdp_cb;	/**< VP dst XDP callback */
++	void *dst_cb_data;		/**< VP dst callback data */
++	ppe_vp_callback_t src_cb;	/**< VP src callback */
++	void *src_cb_data;		/**< VP src callback data */
++	ppe_vp_stats_callback_t stats_cb;
++					/**< VP src callback */
++	uint32_t xmit_port;		/**< Physical port number */
++	uint32_t flags;			/**< PPE VP flags */
++	uint8_t queue_num;		/**< Queue number */
++	uint8_t core_mask;		/**< Core to be used for a particular VP flow */
++	ppe_vp_status_t status;		/**< VP return status */
++	enum ppe_vp_user_type usr_type;	/**< VP user type */
++	enum ppe_vp_net_dev_type net_dev_type;
++					/**< VP netdev type */
++	enum ppe_vp_net_dev_pvt_flags net_dev_flags;
++					/**< VP netdev flags */
++	bool fdb_learn_enabled;
++};
++
++/*
++ * ppe_vp_get_netdev_by_port_num()
++ *	Get the netdevice for port number.
++ *
++ * @param[in] port_num   VP port number.
++ *
++ * @return
++ * Netdevice for the port number.
++ */
++struct net_device *ppe_vp_get_netdev_by_port_num(ppe_vp_num_t port_num);
++
++/*
++ * ppe_vp_mac_addr_clear()
++ *	Clear the MAC address for the virtual port.
++ *
++ * @param[in] port_num   VP port number.
++ *
++ * @return
++ * Success status of clearing MAC address.
++ */
++extern ppe_vp_status_t ppe_vp_mac_addr_clear(ppe_vp_num_t port_num);
++
++/*
++ * ppe_vp_mac_addr_set()
++ *	Set the MAC address for the virtual port.
++ *
++ * @param[in] port_num   VP port number.
++ * @param[in] mac_addr   MAC Address.
++ *
++ * @return
++ * Success status of setting MAC address.
++ */
++extern ppe_vp_status_t ppe_vp_mac_addr_set(ppe_vp_num_t port_num, uint8_t *mac_addr);
++
++/*
++ * ppe_vp_mtu_get()
++ *	Get the MTU for the virtual port.
++ *
++ * @param[in] port_num   VP port number.
++ * @param[in] mtu        Pointer to MTU variable.
++ *
++ * @return
++ * Success status of getting MTU.
++ */
++extern ppe_vp_status_t ppe_vp_mtu_get(ppe_vp_num_t port_num, uint16_t *mtu);
++
++/*
++ * ppe_vp_mtu_set()
++ *	Set the MTU for the virtual port.
++ *
++ * @param[in] port_num   VP port number.
++ * @param[in] mtu        MTU.
++ *
++ * @return
++ * Success status of setting MTU.
++ */
++extern ppe_vp_status_t ppe_vp_mtu_set(ppe_vp_num_t port_num, uint16_t mtu);
++
++/*
++ * ppe_vp_free()
++ *	Free PPE VP interface.
++ *
++ * @param[in] port_num   VP port number.
++ *
++ * @return
++ * Success status of VP free.
++ */
++extern ppe_vp_status_t ppe_vp_free(ppe_vp_num_t port_num);
++
++/*
++ * ppe_vp_free_dev()
++ *	Free PPE VP interface and its netdevice.
++ *
++ * @param[in] netdev    VP netdevice pointer.
++ *
++ * @return
++ * Void.
++ */
++extern void ppe_vp_free_dev(struct net_device *vp_dev);
++
++/*
++ * ppe_vp_cfg_update()
++ *	Update a PPE VP interface.
++ *
++ * @param[in] vp_num     VP number.
++ * @param[in] vpui       VP update info.
++ *
++ * @return
++ * Status of the API.
++ */
++extern ppe_vp_status_t ppe_vp_cfg_update(ppe_vp_num_t vp_num, struct ppe_vp_ui *vpui);
++
++/*
++ * ppe_vp_alloc()
++ *	Allocate a PPE VP interface.
++ *
++ * @param[in] netdev     VP allocator netdevice.
++ * @param[in] vpai       VP allocation info.
++ *
++ * @return
++ * VP number.
++ */
++extern ppe_vp_num_t ppe_vp_alloc(struct net_device *netdev, struct ppe_vp_ai *vpai);
++
++/*
++ * ppe_vp_alloc_dev()
++ *	Allocate a PPE VP interface and netdevice.
++ *
++ * @param[in] netdev     VP allocator netdevice.
++ * @param[in] vpai       VP allocation info.
++ *
++ * @return
++ * pointer to ppe vp netdevice.
++ */
++extern struct net_device *ppe_vp_alloc_dev(struct net_device *netdev, struct ppe_vp_ai *vpai);
++
++/*
++ * ppe_vp_user_type_get()
++ *	Get the user type associated with the PPE VP interface.
++ *
++ * @param[in] vp_num VP number.
++ *
++ * @return
++ * User type of VP.
++ */
++extern ppe_vp_user_type_t ppe_vp_user_type_get(ppe_vp_num_t vp_num);
++
++/*
++ * ppe_vp_update_vp_stats_cb()
++ * 	Update VP stats callback
++ *
++ * @param[in] vp_num		VP number.
++ * @param[in] stats_cb		Statistics callback function pointer.
++ *
++ * @return
++ * Status of the API.
++ */
++extern ppe_vp_status_t ppe_vp_update_vp_stats_cb(int16_t vp_num, ppe_vp_stats_callback_t stats_cb);
++
++
++/**
++ * ppe_vp_veip_alloc_vps()
++ *      Allocate VP structures for both GW and PON ports.
++ *
++ * @param[in] ppe_iface         PPE interface.
++ * @param[in] gw_port_num       Gateway port number.
++ * @param[in] pon_port_num      PON port number.
++ * @param[in] netdev            Netdevice for the VP.
++ * @param[in] vpai              VP allocation info.
++ *
++ * @return
++ * 0 on success, -1 on failure.
++ */
++extern int ppe_vp_veip_alloc_vps(struct ppe_drv_iface *ppe_iface, uint8_t gw_port_num, uint8_t pon_port_num,
++			  struct net_device *netdev, struct ppe_vp_ai *vpai);
++
++/**
++ * ppe_vp_veip_free_vps()
++ *      Free VP structures for VEIP.
++ *
++ * @param[in] ppe_iface         PPE interface.
++ *
++ * @return
++ * None.
++ */
++extern void ppe_vp_veip_free_vps(struct ppe_drv_iface *ppe_iface);
++/** @} */ /* end_addtogroup ppe_vp_public_subsystem */
++
++#endif /* _PPE_VP_PUBLIC_H_ */
+--- a/drivers/net/wireless/ath/ath12k/nss/nss_plugins.h
++++ b/drivers/net/wireless/ath/ath12k/nss/nss_plugins.h
+@@ -0,0 +1,443 @@
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++#ifndef _NSS_PLUGINS_H_
++#define _NSS_PLUGINS_H_
++
++#include <linux/netdevice.h>
++#include <linux/module.h>
++#include "ppe_vp_public.h"
++
++#define PPE_DS_MAX_RING_PER_NODE	2
++#define PPE_DS_WIFI_ARCH_MODE_WIFI7	7
++#define PPE_DS_WIFI_ARCH_MODE_WIFI8	8
++
++/**
++ * ppe_ds_wlan_node_type_t
++ *	PPE-DS node type
++ */
++typedef enum {
++	PPE_DS_NODE_TYPE_2G,		/**< radio 2G */
++	PPE_DS_NODE_TYPE_5G,		/**< radio 5G */
++	PPE_DS_NODE_TYPE_6G,		/**< radio 6G */
++	PPE_DS_NODE_TYPE_MAX,
++} ppe_ds_wlan_node_type_t;
++
++/**
++ * ppe_ds_wlan_txdesc_elem
++ *	PPEDS WLAN Tx descriptor element information
++ */
++struct ppe_ds_wlan_txdesc_elem {
++	uint32_t opaque_lo;		/**< Low 32-bit opaque field content */
++	uint32_t opaque_hi;		/**< High 32-bit opaque field content */
++	dma_addr_t buff_addr;		/**< Buffer address */
++};
++
++/**
++ * ppe_ds_wlan_rxdesc_elem
++ *	PPEDS WLAN Rx descriptor element information
++ */
++struct ppe_ds_wlan_rxdesc_elem {
++	unsigned long cookie;		/**< cookie information */
++};
++
++struct ppe_wlan_plugin_stats;
++
++/**
++ * ppe_ds_wlan_handle
++ *	PPE-DS WLAN handle
++ */
++typedef struct ppe_ds_wlan_handle {
++	uint32_t reserved;			/**< Reserved */
++	char priv[] __aligned(NETDEV_ALIGN);	/**< contains the address of WLAN SoC base address */
++} ppe_ds_wlan_handle_t;
++
++/**
++ * ppe_ds_wlan_ctx_info_handle
++ *	PPE-DS wlan umac reset handle
++ */
++struct ppe_ds_wlan_ctx_info_handle {
++	uint32_t umac_reset_inprogress;		/**< umac reset in progress information */
++};
++
++/**
++ * ppe_ds_wlan_reg_info
++ *	PPE-DS WLAN rings information
++ */
++struct ppe_ds_wlan_reg_info {
++	dma_addr_t ppe2tcl_ba;		/**< PPE2TCL ring base address */
++	dma_addr_t reo2ppe_ba;		/**< REO2PPE ring base address */
++	uint32_t ppe2tcl_num_desc;	/**< PPE2TCL ring descriptor count */
++	uint32_t reo2ppe_num_desc;	/**< REO2PPE ring descriptor count */
++	ppe_ds_wlan_node_type_t node_type;	/**< PPE-DS node type */
++	uint32_t ppe2tcl_start_idx;		/**< PPE2TCL ring index */
++	uint32_t reo2ppe_start_idx;		/**< REO2PPE ring index */
++	bool ppe_ds_int_mode_enabled;	/**< Interrupt mode to process PPE2TCL */
++	uint8_t dp_ppeds_node_id;	/**< Node id of ds node */
++};
++
++struct ppe_ds_reg_addr_info {
++	void __iomem *vaddr; /**< Virtual address */
++	dma_addr_t paddr; /**< Physical address */
++};
++
++/**
++ * ppe_ds_wlan_reg_data_ring_cfg
++ *	Data ring information
++ */
++struct ppe_ds_wlan_reg_data_ring_cfg {
++	uint8_t num_reo2ppe;	/**< Number of REO2PPE ring*/
++	uint8_t num_ppe2tcl;	/**< Number of PPE2TCL ring*/
++	dma_addr_t ppe2tcl_ba[PPE_DS_MAX_RING_PER_NODE];	/**< PPE2TCL ring base address */
++	dma_addr_t reo2ppe_ba[PPE_DS_MAX_RING_PER_NODE];	/**< REO2PPE ring base address */
++	uint32_t ppe2tcl_num_desc[PPE_DS_MAX_RING_PER_NODE];	/**< PPE2TCL ring descriptor count */
++	uint32_t reo2ppe_num_desc[PPE_DS_MAX_RING_PER_NODE];	/**< REO2PPE ring descriptor count */
++};
++
++/**
++ * ppe_ds_wlan_reg_data_ring_hptp_cfg
++ *	Data ring TX RX information.
++ */
++struct ppe_ds_wlan_reg_data_ring_hptp_cfg {
++	struct ppe_ds_reg_addr_info wlan_ppe2tcl_hp_addr[PPE_DS_MAX_RING_PER_NODE];	/**< edma PPE2TCL Producer register address */
++	struct ppe_ds_reg_addr_info wlan_reo2ppe_tp_addr[PPE_DS_MAX_RING_PER_NODE];	/**< edma REO2PPE consumer register address */
++	struct ppe_ds_reg_addr_info edma_txdesc_prod_addr[PPE_DS_MAX_RING_PER_NODE];	/**< edma TXDESC producer register address */
++	struct ppe_ds_reg_addr_info edma_rxdesc_cons_addr[PPE_DS_MAX_RING_PER_NODE];	/**< edma RXDESC consumer register address */
++};
++
++/**
++ * ppe_ds_wlan_reg_hbm_ring_cfg
++ *	HW buffer ring information
++ */
++struct ppe_ds_wlan_reg_hbm_ring_cfg {
++	dma_addr_t tqm2ppe_ba;	/**< TQM2PPE ring's base address */
++	dma_addr_t ppe2wbm_ba;	/**< PPE2WBM ring's base address */
++	uint32_t tqm2ppe_num_desc;	/**< TQM2PPE descriptor count */
++	uint32_t ppe2wbm_num_desc;	/**< PPE2WBM descriptor count */
++};
++
++/**
++ * ppe_ds_wlan_reg_hbm_ring_hptp_cfg
++ *	HW buffer ring TX RX information.
++ */
++struct ppe_ds_wlan_reg_hbm_ring_hptp_cfg {
++	struct ppe_ds_reg_addr_info edma_txcmpl_cons_addr;	/**< edma TXCMPL consumer register address */
++	struct ppe_ds_reg_addr_info edma_rxfill_prod_addr;	/**< edma RXFILL Producer register address */
++	struct ppe_ds_reg_addr_info wlan_ppe2wbm_hp_addr;	/**< edma PPE2WBM Producer register address */
++	struct ppe_ds_reg_addr_info wlan_tqm2ppe_tp_addr;	/**< edma TQM2PPE tail pointer register address */
++};
++
++/**
++ * ppe_ds_wlan_arch_reg_info
++ *	PPE-DS WLAN rings information for wifi7/wifi8
++ */
++struct ppe_ds_wlan_arch_reg_info {
++	ppe_ds_wlan_node_type_t node_type;	/**< PPE-DS node type */
++	uint8_t dp_ppeds_node_id;	/**< Node id of ds node */
++	uint8_t wifi_arch_mode;	/**< 7 = wifi 7, 8 = wifi8 */
++
++	union {
++		struct {
++			dma_addr_t ppe2tcl_ba;	/**< PPE2TCL ring base address */
++			dma_addr_t reo2ppe_ba;	/**< REO2PPE ring base address */
++			uint32_t ppe2tcl_num_desc;	/**< PPE2TCL ring descriptor count */
++			uint32_t reo2ppe_num_desc;	/**< REO2PPE ring descriptor count */
++			uint32_t ppe2tcl_start_idx;	/**< PPE2TCL ring index */
++			uint32_t reo2ppe_start_idx;	/**< REO2PPE ring index */
++			bool ppe_ds_int_mode_enabled;	/**< Interrupt mode to process PPE2TCL */
++		} wifi7_cfg;
++
++		struct {
++			uint8_t data_ring_auto_index_en;	/**< Auto index Enabled / Disabled by EDMA*/
++			uint8_t hw_buff_mgmt_en;	/**< HW buffer manager Enabled / Disabled by EDMA */
++			struct {
++				struct ppe_ds_wlan_reg_data_ring_cfg ring_info;
++				struct ppe_ds_wlan_reg_data_ring_hptp_cfg txrx_info;
++			} data_ring;
++
++			struct {
++				struct ppe_ds_wlan_reg_hbm_ring_cfg ring_info;
++				struct ppe_ds_wlan_reg_hbm_ring_hptp_cfg txrx_info;
++			} hw_buf_mgmt;
++		} wifi8_cfg;
++	};
++};
++
++struct ppe_vp_ui;
++
++/**
++ * ppe_ds_wlan_rxfill_ring_info_wifi7
++ *	WiFi7 PPE-DS RxFill ring filled-count information (single SW ring, no HW buffer management)
++ */
++struct ppe_ds_wlan_rxfill_ring_info_wifi7 {
++	uint16_t prim_prod_idx;		/**< RxFill ring producer index */
++	uint16_t prim_cons_idx;		/**< RxFill ring consumer index (read from HW) */
++	uint16_t prim_active_cnt;	/**< RxFill ring active count */
++};
++
++/**
++ * ppe_ds_wlan_rxfill_ring_info_wifi8
++ *	WiFi8 PPE-DS SW and HW RxFill ring filled-count information
++ */
++struct ppe_ds_wlan_rxfill_ring_info_wifi8 {
++	uint16_t prim_prod_idx;		/**< SW RxFill ring producer index */
++	uint16_t prim_cons_idx;		/**< SW RxFill ring consumer index (read from HW) */
++	uint16_t prim_active_cnt;	/**< SW RxFill ring active count */
++	uint16_t secd_prod_idx;		/**< HW RxFill ring producer index (read from HW) */
++	uint16_t secd_cons_idx;		/**< HW RxFill ring consumer index */
++	uint16_t secd_active_cnt;	/**< HW RxFill ring active count */
++	bool hw_buff_mgmt_en;		/**< HW buffer manager enabled flag */
++};
++
++/**
++ * ppe_ds_wlan_rxfill_ring_info
++ *	Generic PPE-DS RxFill ring filled-count information, arch-specific via union
++ */
++struct ppe_ds_wlan_rxfill_ring_info {
++	uint8_t arch_mode;			/**< WiFi architecture mode (PPE_DS_WIFI_ARCH_MODE_WIFI7/8) */
++	union {
++		struct ppe_ds_wlan_rxfill_ring_info_wifi7 wifi7;	/**< WiFi7 RxFill ring info */
++		struct ppe_ds_wlan_rxfill_ring_info_wifi8 wifi8;	/**< WiFi8 RxFill ring info */
++	};
++};
++
++#define ppe_ds_wlan_ops_v2 ppe_ds_wlan_ops
++
++/**
++ * ppe_ds_wlan_ops
++ *	PPE-DS WLAN operations
++ */
++struct ppe_ds_wlan_ops {
++	uint32_t (*get_tx_desc_many)(int ppeds_node_id, struct ppe_ds_wlan_txdesc_elem *,
++			uint32_t num_buff_req, uint32_t buff_size, uint32_t headroom);
++	/**< Callback to get WLAN Tx descriptors and buffers */
++	void (*release_tx_desc_single)(int ppeds_node_id, uint32_t cookie);
++	/**< Callback to release WLAN Tx descriptor and buffer */
++	void (*set_tcl_prod_idx)(int ppeds_node_id, uint16_t tcl_prod_idx);
++	/**< Callback to set PPE2TCL ring's producer index */
++	void (*set_reo_cons_idx)(int ppeds_node_id, uint16_t reo_cons_idx);
++	/**< Callback to set REO2PPE ring's consumer index */
++	uint16_t (*get_tcl_cons_idx)(int ppeds_node_id);
++	/**< Callback to get PPE2TCL ring's consumer index */
++	uint16_t (*get_reo_prod_idx)(int ppeds_node_id);
++	/**< Callback to get REO2PPE ring's producer index */
++	void (*release_rx_desc)(int ppeds_node_id,
++			struct ppe_ds_wlan_rxdesc_elem *arr, uint16_t count);
++	/**< Callback to release WLAN Rx descriptors and buffers */
++	void (*enable_tx_consume_intr)(int ppeds_node_id,
++			bool enable);
++	/**< Callback to toggle wlan interrupt */
++	void (*notify_napi_done)(int ppeds_node_id);
++	/**< Callback to trigger after ppeds ring process completes */
++	uint8_t (*get_wlan_arch_mode)(void);
++	/**< Returns whether WLAN is wifi7 or wifi8 */
++};
++
++/*
++ * ds_inst_alloc_func_t
++ * 	Callback for PPE_DS WLAN instance allocation
++ *
++ * @param[in] ppe_ds_wlan_ops PPE-DS WLAN operations
++ * @param[in] priv_size sizeof dp_soc_be
++ *
++ * @return
++ * PPE-DS node id
++ *
++ */
++typedef int (*ds_inst_alloc_func_t)(struct ppe_ds_wlan_ops *ops, size_t priv_size);
++
++/*
++ * ds_inst_start_func_t
++ * 	Callback for ppe_ds_wlan_instance_start
++ *
++ * @param[in] ppe_ds_wlan_ctx_info_handle PPE-DS wlan umac reset handle
++ * @param[in] ppeds_node_id Index of PPE-DS node configuration
++ *
++ * @return
++ * Status of PPE-DS instance registration operation
++ *
++ */
++typedef int (*ds_inst_start_func_t)(struct ppe_ds_wlan_ctx_info_handle *wlan_info_hd, int ppeds_node_id);
++
++/*
++ * ds_inst_register_func_t
++ * 	Callback for ppe_ds_wlan_inst_register
++ *
++ * @param[in] ppe_ds_wlan_reg_info PPE-DS WLAN rings information
++ * @param[in] ppeds_node_id Index of PPE-DS node configuration
++ *
++ * @return
++ * True/False
++ *
++ */
++typedef bool (*ds_inst_register_func_t)(struct ppe_ds_wlan_reg_info *reg_info, int ppeds_node_id);
++
++/*
++ * ds_inst_register_func_wifi_arch_mode_t
++ * 	Callback for ppe_ds_wlan_inst_register_arch_mode_wifi7/wifi8
++ *
++ * @param[in] ppe_ds_wlan_arch_reg_info PPE-DS WLAN rings information
++ * @param[in] ppeds_node_id Index of PPE-DS node configuration
++ *
++ * @return
++ * True/False
++ *
++ */
++typedef bool (*ds_inst_register_func_wifi_arch_mode_t)(struct ppe_ds_wlan_arch_reg_info *reg_info, int ppeds_node_id);
++
++/*
++ * ds_inst_stop_func_t
++ * 	Callback for ppe_ds_wlan_instance_stop
++ *
++ * @param[in] ppeds_node_id Index of PPE-DS node configuration
++ *
++ * @return
++ * None
++ *
++ */
++typedef void (*ds_inst_stop_func_t)(struct ppe_ds_wlan_ctx_info_handle *wlan_info_hd, int ppeds_node_id);
++
++/*
++ * ds_inst_free_func_t
++ * 	Callback for ppe_ds_wlan_inst_free
++ *
++ * @param[in] ppe_ds_wlan_ctx_info_handle PPE-DS umac reset Information handle
++ * @param[in] ppeds_node_id Index of PPE-DS node configuration
++ *
++ * @return
++ * None
++ *
++ */
++typedef void (*ds_inst_free_func_t)(int ppeds_node_id);
++
++/*
++ * ds_inst_get_ctx_func_t
++ * 	Callback for ppe_ds_wlan_get_intr_ctxt
++ *
++ * @param[in] ppeds_node_id Index of PPE-DS node configuration
++ *
++ * @return
++ * Context from ppe
++ *
++ */
++typedef void* (*ds_inst_get_ctx_func_t)(int ppeds_node_id);
++
++/*
++ * ds_inst_ppe2tcl_intr_func_t
++ * 	Callback for ppe_ds_ppe2tcl_wlan_handle_intr
++ *
++ * @param[in] ppeds_node_id Index of PPE-DS node configuration
++ *
++ * @return
++ * 0
++ *
++ */
++typedef int (*ds_inst_ppe2tcl_intr_func_t)(int ppeds_node_id);
++
++/*
++ * ds_inst_reo2ppe_intr_func_t
++ * 	Callback for ppe_ds_reo2ppe_wlan_handle_intr
++ *
++ * @param[in] ppeds_node_id Index of PPE-DS node configuration
++ *
++ * @return
++ * 0
++ *
++ */
++typedef int (*ds_inst_reo2ppe_intr_func_t)(int ppeds_node_id);
++
++/*
++ * ds_inst_stats_update_func_t
++ * 	Callback for stat update
++ * @param[in] net_device ath dev
++ * @param[in] ppe_wlan_plugin_stats Plugin stat
++ *
++ * @return
++ * None
++ */
++typedef void (*ds_inst_stats_update_func_t)(struct net_device *ath_dev, struct ppe_wlan_plugin_stats *stats);
++
++/*
++ * get_vp_num_func_t
++ * 	Callback for ppe_vp_get_vp
++ *
++ * @param[in] net_device ath dev
++ *
++ * @return
++ * VP number for the netdev
++ */
++typedef int16_t (*get_vp_num_func_t)(struct net_device *ath_dev);
++
++/*
++ * service_status_update_func_t
++ * 	Callback for ppe_ds_wlan_service_status_update
++ *
++ * @param[in] ppeds_node_id Index of PPE-DS node configuration
++ * @param[in] enable enable/disable bit
++ *
++ * @return
++ * None
++ */
++typedef void (*service_status_update_func_t)(int ppeds_node_id, bool enable);
++
++/*
++ * update_vp_config_func_t
++ * 	Callback for ppe_vp_status_update
++ *
++ * @param[in] net_device ath dev
++ * @param[in] ppe_vp_ui VP update info
++ *
++ * @return
++ * ppe_vp_status_t
++ */
++typedef ppe_vp_status_t (*update_vp_config_func_t)(struct net_device *ath_dev, struct ppe_vp_ui *vpui);
++
++/*
++ * get_rxfill_ring_info_func_t
++ * 	Callback for ppe_ds_wlan_get_rxfill_ring_info
++ *
++ * @param[in] ppeds_node_id Index of PPE-DS node configuration
++ * @param[out] info RxFill ring filled-count info
++ *
++ * @return
++ * None
++ */
++typedef void (*get_rxfill_ring_info_func_t)(int ppeds_node_id,
++		struct ppe_ds_wlan_rxfill_ring_info *info);
++
++/**
++ * nss_plugins_ops
++ * 	Data structure for NSS Plugin ops
++ */
++struct nss_plugins_ops {
++	ds_inst_alloc_func_t ds_inst_alloc;		/**< Callback for PPE-DS WLAN instance allocation API */
++	ds_inst_start_func_t ds_inst_start;		/**< Callback for PPE-DS WLAN instance start API */
++	ds_inst_register_func_t ds_inst_register;		/**< Callback for PPE-DS WLAN instance registration API */
++	ds_inst_register_func_wifi_arch_mode_t ds_inst_register_wifi_arch_mode;		/**< Callback for PPE-DS WLAN instance registration API */
++	ds_inst_stop_func_t ds_inst_stop;		/**< Callback for PPE-DS WLAN instance stop API */
++	ds_inst_free_func_t ds_inst_free;		/**< Callback for PPE-DS WLAN instance free API */
++	ds_inst_get_ctx_func_t ds_inst_get_ctx;		/**< Callback for ppe_ds_wlan_get_intr_ctxt API */
++	ds_inst_ppe2tcl_intr_func_t ds_inst_ppe2tcl_intr;		/**< Callback for PPE-DS PPE2TCL IRQ Tx processing API */
++	ds_inst_reo2ppe_intr_func_t ds_inst_reo2ppe_intr;		/**< Callback for PPE-DS REO2PPE IRQ Rx processing API */
++	ds_inst_stats_update_func_t ds_inst_stats_update;		/**< Callback for stat update */
++	get_vp_num_func_t get_vp_num;		/**< Callback to get vp number */
++	service_status_update_func_t service_status_update;		/**< Callback to get status update */
++	update_vp_config_func_t vp_cfg_update; 		/**< Callback to update VP config */
++	get_rxfill_ring_info_func_t get_rxfill_ring_info;	/**< Callback to get RxFill ring filled-count info */
++};
++
++/*
++ * qca_nss_wifi_plugins_get_ops
++ *	API to get the nss plugin operations
++ *
++ * @datatypes
++ * nss_plugins_ops
++ *
++ * @return
++ * nss_plugins_ops operation structure, else NULL
++ */
++struct nss_plugins_ops* qca_nss_wifi_plugins_get_ops(void);
++
++#endif
+--- a/drivers/net/wireless/ath/ath12k/nss/ppe_ds_wlan.h
++++ b/drivers/net/wireless/ath/ath12k/nss/ppe_ds_wlan.h
+@@ -0,0 +1,274 @@
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * SPDX-License-Identifier: ISC
++ */
++
++/**
++ * @file ppe_ds_wlan.h
++ *	PPE-DS WLAN specific definitions.
++ */
++
++#ifndef _PPE_DS_WLAN_H_
++#define _PPE_DS_WLAN_H_
++#include "ppe_vp_public.h"
++#include "nss_plugins.h"
++
++struct ppe_ds;
++struct ppe_ds_wlan_rxfill_ring_info;
++/**
++ * ppe_ds_wlan_priv
++ *	Wrapper to return PPE-DS WLAN handle's private area pointer.
++ *
++ * @datatypes
++ * ppe_ds_wlan_handle_t
++ *
++ * @param[in] wlan_handle   PPE-DS WLAN handle
++ */
++static inline void *ppe_ds_wlan_priv(ppe_ds_wlan_handle_t *wlan_handle)
++{
++	return ((void *)&wlan_handle->priv);
++}
++
++/**
++ * ppe_ds_wlan_rx
++ *	PPE-DS WLAN REO2PPE processing API
++ *
++ * @datatypes
++ * ppe_ds_wlan_handle_t
++ *
++ * @param[in] wlan_handle    PPE-DS WLAN handle
++ * @param[in] reo_prod_idx   REO2PPE producer index
++ */
++void ppe_ds_wlan_rx(ppe_ds_wlan_handle_t *wlan_handle, uint16_t reo_prod_idx);
++
++/**
++ * ppe_ds_wlan_vp_alloc
++ *	PPE-DS WLAN VP alloc API
++ *
++ * @datatypes
++ * ppe_ds_wlan_handle_t
++ * net_device
++ * ppe_vp_ai
++ *
++ * @param[in] wlan_handle   PPE-DS WLAN handle
++ * @param[in] dev           WLAN VAP interface
++ * @param[in] vpai          PPE-VP alloc parameter
++ *
++ * @return
++ * PPE-VP port number if success, -1 if error
++ */
++ppe_vp_num_t ppe_ds_wlan_vp_alloc(ppe_ds_wlan_handle_t *wlan_handle, struct net_device *dev, struct ppe_vp_ai *vpai);
++
++/**
++ * ppe_ds_wlan_get_node_id
++ *	PPE-DS WLAN get node id API
++ *
++ * @datatypes
++ * ppe_ds_wlan_handle_t
++ *
++ * @param[in] wlan_handle   PPE-DS WLAN handle
++ *
++ * @return
++ * valid node id if success, invalid node id if error
++ */
++uint32_t ppe_ds_wlan_get_node_id(ppe_ds_wlan_handle_t *wlan_handle);
++
++/**
++ * ppe_ds_wlan_vp_free
++ *	PPE-DS WLAN VP free API
++ *
++ * @datatypes
++ * ppe_ds_wlan_handle_t
++ * ppe_vp_num_t
++ *
++ * @param[in] wlan_handle   PPE-DS WLAN handle
++ * @param[in] vp_num        PPE-VP port number
++ *
++ * @return
++ *  0 on success
++ */
++ppe_vp_status_t ppe_ds_wlan_vp_free(ppe_ds_wlan_handle_t *wlan_handle, ppe_vp_num_t vp_num);
++
++/**
++ * ppe_ds_wlan_inst_register_arch_mode_wifi7
++ *	PPE-DS WLAN instance registration API for Wi-Fi 7 architecture
++ *
++ * @datatypes
++ * ppe_ds
++ * ppe_ds_wlan_arch_reg_info
++ *
++ * @param[in] node      PPE-DS node
++ * @param[in] ring_info PPE-DS arch ring information
++ *
++ * @return
++ * Status of the PPE-DS WLAN instance registration
++ */
++bool ppe_ds_wlan_inst_register_arch_mode_wifi7(struct ppe_ds *node, struct ppe_ds_wlan_arch_reg_info *ring_info);
++
++/**
++ * ppe_ds_wlan_inst_register_arch_mode_wifi8
++ *	PPE-DS WLAN instance registration API for Wi-Fi 8 architecture
++ *
++ * @datatypes
++ * ppe_ds
++ * ppe_ds_wlan_arch_reg_info
++ *
++ * @param[in] node      PPE-DS node
++ * @param[in] ring_info PPE-DS arch ring information
++ *
++ * @return
++ * Status of the PPE-DS WLAN instance registration (always false until Wi-Fi 8 is implemented)
++ */
++bool ppe_ds_wlan_inst_register_arch_mode_wifi8(struct ppe_ds *node, struct ppe_ds_wlan_arch_reg_info *ring_info);
++
++/**
++ * ppe_ds_wlan_instance_stop
++ *	PPE-DS WLAN instance stop API
++ *
++ * @datatypes
++ * ppe_ds
++ * ppe_ds_wlan_ctx_info_handle
++ *
++ * @param[in] node   PPE-DS node
++ * @param[in] wlan_info_hdl    WLAN ctx information handle
++ */
++void ppe_ds_wlan_instance_stop(struct ppe_ds *node,
++		struct ppe_ds_wlan_ctx_info_handle *wlan_info_hdl);
++
++/**
++ * ppe_ds_wlan_instance_start
++ *	PPE-DS WLAN instance start API
++ *
++ * @datatypes
++ * ppe_ds
++ * ppe_ds_wlan_ctx_info_handle
++ *
++ * @param[in] node   PPE-DS node
++ * @param[in] wlan_info_hdl    WLAN ctx information handle
++ *
++ * @return
++ * Status of the PPE-DS WLAN instance start
++ */
++int ppe_ds_wlan_instance_start(struct ppe_ds *node,
++		struct ppe_ds_wlan_ctx_info_handle *wlan_info_hdl);
++
++/**
++ * ppe_ds_wlan_inst_free
++ *	PPE-DS WLAN instance free API
++ *
++ * @datatypes
++ * ppe_ds
++ *
++ * @param[in] node   PPE-DS node
++ */
++void ppe_ds_wlan_inst_free(struct ppe_ds *node);
++
++/**
++ * ppe_ds_wlan_inst_alloc
++ *	PPE-DS WLAN instance allocation API
++ *
++ * @datatypes
++ * ppe_ds_wlan_handle_t
++ * ppe_ds_wlan_ops
++ *
++ * @param[in] ops         PPE-DS WLAN operation callbacks
++ * @param[in] priv_size   Size of PPE-DS WLAN handle's private area
++ *
++ * @return
++ * PPE-DS node
++ */
++struct ppe_ds *ppe_ds_wlan_inst_alloc(struct ppe_ds_wlan_ops *ops, size_t priv_size);
++
++/**
++ * ppe_ds_get_node_id
++ *	Return PPEDS node id for a ppeds node
++ *
++ * @datatypes
++ * ppe_ds
++ *
++ * @param[in] node	PPE-DS node
++ *
++ * @return
++ * valid node id if success, invalid node id if error
++ */
++uint32_t ppe_ds_get_node_id(struct ppe_ds *node);
++
++/**
++ * ppe_ds_ppe2tcl_wlan_handle_intr
++ *	PPE-DS WLAN irq handling for ppe2tcl ring
++ *
++ * @param[in] ctxt IRQ context
++ *
++ */
++int ppe_ds_ppe2tcl_wlan_handle_intr(void *ctxt);
++
++/**
++ * ppe_ds_reo2ppe_wlan_handle_intr
++ *	PPE-DS WLAN irq handling for reo2ppe ring
++ *
++ * @param[in] ctxt IRQ context
++ *
++ */
++int ppe_ds_reo2ppe_wlan_handle_intr(void *ctxt);
++
++/**
++ * ppe_ds_wlan_get_intr_ctxt
++ *	PPE-DS get wlan context
++ *
++ * @datatypes
++ * ppe_ds
++ *
++ * @param[in] node   PPE-DS node
++ */
++void *ppe_ds_wlan_get_intr_ctxt(struct ppe_ds *node);
++
++/**
++ * ppe_ds_wlan_service_status_update
++ *	PPE-DS ring service update
++ *
++ * @datatypes
++ * ppe_ds
++ *
++ * @param[in] node   PPE-DS node
++ * @param[in] enable        Enable/Disable service
++ */
++void ppe_ds_wlan_service_status_update(struct ppe_ds *node, bool enable);
++
++/**
++ * ppe_ds_wlan_get_rxfill_ring_info
++ *	Get RxFill ring filled-count information
++ *
++ * @datatypes
++ * ppe_ds
++ * ppe_ds_wlan_rxfill_ring_info
++ *
++ * @param[in] node   PPE-DS node
++ * @param[out] info  Pointer to rxfill ring info structure to be filled
++ */
++void ppe_ds_wlan_get_rxfill_ring_info(struct ppe_ds *node,
++				struct ppe_ds_wlan_rxfill_ring_info *info);
++
++/**
++ * ppe_ds_wlan_plugins_cb_register
++ * 	Callback for ppeds plugin registration
++ *
++ * @datatypes
++ * ppe_ds_wlan_ops
++ *
++ * @return
++ * status of registration
++ *
++ */
++int ppe_ds_wlan_plugins_cb_register(struct ppe_ds_wlan_ops *wlan_ops);
++
++/**
++ * ppe_ds_wlan_plugins_cb_unregister
++ * 	Callback for ppeds plugin unregistration
++ *
++ * @return
++ * none
++ *
++ */
++void ppe_ds_wlan_plugins_cb_unregister(void);
++
++#endif	/* _PPE_DS_WLAN_H_ */

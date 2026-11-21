@@ -376,6 +376,7 @@ define KernelPackage/ath12k
   +kmod-crypto-michael-mic +kmod-qrtr-mhi \
   +TARGET_qualcommax:kmod-qrtr-smd +TARGET_qualcommbe:kmod-qrtr-smd \
   +kmod-qcom-qmi-helpers +@DRIVER_11BE_SUPPORT +TARGET_qualcommbe:kmod-qcom-ppe \
+  +TARGET_qualcommbe:kmod-qca-nss-ppe-ds +TARGET_qualcommbe:kmod-qca-nss-ppe-vp \
   +ATH12K_THERMAL:kmod-hwmon-core +ATH12K_THERMAL:kmod-thermal
   FILES:= \
 	$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/ath12k.ko \
