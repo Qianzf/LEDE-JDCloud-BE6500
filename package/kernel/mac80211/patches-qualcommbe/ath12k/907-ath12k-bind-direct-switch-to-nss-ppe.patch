@@ -49,7 +49,7 @@ as ppe_ds_wlan_ops.
  				    unsigned int count, unsigned int size)
  {
  	struct ath12k_ds *ds = priv;
-@@ -556,18 +562,274 @@
+@@ -556,18 +562,293 @@
  	return READ_ONCE(ds->hw1_pending);
  }
  
@@ -298,12 +298,23 @@ as ppe_ds_wlan_ops.
 +	return 0;
 +}
 +
++/* qca-nss-ppe only direct-switches flows whose VP carries a core mask; with
++ * core_mask == 0 the flow falls back to PPE_DRV_SC_VP_RPS, i.e. to the CPU.
++ * Mirror the masks qca-nss-ppe itself defaults to (cpu_mask_2g = 0x2,
++ * cpu_mask_5g_lo = 0x1).
++ */
++static u8 ath12k_ds_core_mask(struct ath12k_ds *ds)
++{
++	return ds->dp->ab->hif.bus == ATH12K_BUS_AHB ? 0x2 : 0x1;
++}
++
 +static int ath12k_ds_nss_vp_alloc(struct ath12k_ds *ds, struct net_device *dev)
 +{
 +	struct ppe_vp_ai vpai = {};
 +
 +	vpai.usr_type = PPE_VP_USER_TYPE_DS;
 +	vpai.net_dev_type = PPE_VP_NET_DEV_TYPE_WIFI;
++	vpai.core_mask = ath12k_ds_core_mask(ds);
 +	vpai.status = PPE_VP_STATUS_SUCCESS;
 +	/* ppe_ds_wlan_vp_alloc() would need the internal ppe_ds_wlan_handle_t;
 +	 * ppe_vp_alloc() is the same path and is exported directly.
@@ -317,8 +328,16 @@ as ppe_ds_wlan_ops.
 +
 +	if (port < 0)
 +		return -ENODEV;
-+	ui.usr_type = direct ? PPE_VP_USER_TYPE_DS : PPE_VP_USER_TYPE_NONE;
-+	ui.update_flags = PPE_VP_UPDATE_FLAG_VP_USR_TYPE;
++	if (direct) {
++		ui.usr_type = PPE_VP_USER_TYPE_DS;
++		ui.core_mask = ath12k_ds_core_mask(ds);
++	} else {
++		ui.usr_type = PPE_VP_USER_TYPE_NONE;
++		ui.core_mask = 0;
++	}
++	/* nss-ppe only applies usr_type when core_mask is part of the update. */
++	ui.update_flags = PPE_VP_UPDATE_FLAG_VP_USR_TYPE |
++			  PPE_VP_UPDATE_FLAG_VP_CORE_MASK;
 +
 +	return ppe_vp_cfg_update(port, &ui);
 +}
