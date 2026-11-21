@@ -1,0 +1,30 @@
+#!/bin/sh
+#
+# A proxy package that redirects LAN DNS while it has no usable outbound node
+# breaks name resolution for every client: the nftables "DNS hijack" rule sends
+# port 53 to a listener that has nothing to forward to, and browsers report
+# DNS_PROBE_FINISHED_BAD_CONFIG until the user configures a node or disables the
+# package.
+#
+# On a factory-default system homeproxy.config.main_node still points at a node
+# section that does not exist.  Detect exactly that state and keep homeproxy off
+# so a freshly reset router has working DNS.  A configured or serverside-only
+# setup is left untouched.
+
+[ -f /etc/config/homeproxy ] || exit 0
+
+main_node=$(uci -q get homeproxy.config.main_node)
+server_enabled=$(uci -q get homeproxy.server.enabled)
+[ "$server_enabled" = "1" ] && exit 0
+[ -n "$main_node" ] && [ "$main_node" != "nil" ] && \
+	uci -q get "homeproxy.$main_node" >/dev/null 2>&1 && exit 0
+
+logger -t uci-defaults "homeproxy has no usable outbound node, disabling it to keep DNS working"
+uci -q set homeproxy.config.main_node='nil'
+uci -q set homeproxy.config.main_udp_node='nil'
+uci -q commit homeproxy
+
+/etc/init.d/homeproxy disable 2>/dev/null
+/etc/init.d/homeproxy stop 2>/dev/null
+
+exit 0
