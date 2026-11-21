@@ -186,7 +186,10 @@
 			port@0 {
 				reg = <0>;
 				label = "cpu";
-				ethernet = <&ppe_qca8386>;
+				/* the CPU port is the nss-dp netdev on the QSDK stack;
+				 * the mainline PPE port it used to reference is disabled
+				 */
+				ethernet = <&nss_dp_switch>;
 				dsa-tag-protocol = "qca_4b";
 				phy-mode = "2500base-x";
 

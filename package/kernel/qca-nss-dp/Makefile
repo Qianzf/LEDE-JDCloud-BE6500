@@ -12,6 +12,12 @@ PKG_MIRROR_HASH:=skip
 PKG_BUILD_PARALLEL:=1
 PKG_FLAGS:=nonshared
 
+# qca-nss-dp needs qca-ssdk and qca-nss-ppe symbols at modpost time, while
+# qca-nss-ppe-ds/-vp need qca-nss-dp symbols.  The kmod DEPENDS below are
+# therefore circular and make drops one edge, which leaves the build order
+# undefined; pin it so the shared Module.symvers are always installed first.
+PKG_BUILD_DEPENDS:=qca-ssdk qca-nss-ppe
+
 include $(INCLUDE_DIR)/kernel.mk
 include $(INCLUDE_DIR)/package.mk
 

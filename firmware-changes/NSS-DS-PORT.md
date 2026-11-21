@@ -355,3 +355,107 @@ ls /sys/kernel/debug/ppe/direct_switch    # 期望 node:0 node:1 都 running:1
 工作副本：`build_dir/target-aarch64_cortex-a53_musl/linux-qualcommbe_ipq53xx/mac80211-regular/backports-7.2/drivers/net/wireless/ath/ath12k/`
 
 分支状态：`qca-nss-ds-stack @ 1a9611b2c` + 未提交的 907 改动（`nss/` 头 + `ppe_ds.c` 改写）
+
+---
+
+## 13. 待办事项（按优先级）
+
+### A. 进行中
+
+- [ ] **全量编译**（`make -j4 V=w`，日志 `/tmp/full2.log`，起于 15:43）
+  - [ ] `check-size 7168k` 是否通过（余量只有 ~47 KiB）
+  - [ ] 记录最终 Image / FIT / sysupgrade 镜像大小
+  - [ ] 确认 `undefined!` 数量仍为 0
+  - [ ] 记下镜像路径与 md5
+
+### B. 依赖循环（有证据才动手）
+
+- [ ] 若出现 `WARNING: modpost: ... undefined!` 或某个 `.ko` 的 `depends=` 缺项：
+  1. `package/kernel/qca-nss-dp/Makefile` 加 `PKG_BUILD_DEPENDS:=qca-ssdk qca-nss-ppe`，把编序钉成
+     `ssdk → ppe → dp → ppe-ds → ppe-vp`
+  2. 把导出头 + `Module.symvers` 的安装挪进 `Build/InstallDev`（现在是手工拷）
+  3. 包级 `DEPENDS` 保持成环（opkg 全装，无害）
+- [ ] **清除手工绕过**：`staging_dir/.../usr/share/{qca-nss-ppe,qca-ssdk}/*.symvers` 与
+      `usr/include/qca-nss-dp/*` 是手工补的，clean 后不重现；要么固化成 `InstallDev`，要么删掉验证能否自洽
+
+### C. 验证（关键，先做低成本的那个）
+
+- [ ] **§9.1 前置验证**：旧实现（自研传输 + 906）放行 `ATH12K_HW_IPQ5332_HW10`，刷机看 AHB 是否也出现
+      `direct switch`。若出现 → 说明 QSDK 栈其实不必要，可整体回退
+- [ ] 新栈刷机验证：
+  - [ ] `dmesg | grep -i "Direct Switch"` 出现两条（AHB + PCI）
+  - [ ] `/sys/kernel/debug/ppe/direct_switch` 两个 node `running:1`，`refill_fail` 不涨
+  - [ ] 2.4G 打流 8 秒：`down_desc`/`up_desc` 递增，而 `wlan0-0` tx/rx 基本不动
+  - [ ] 5G 同上（`wlan0-1`）
+  - [ ] 反证：停流后 `active_flows` 清空、`tx_dropped`/`bad_cookie` 不增长
+- [ ] **有线网络**：nss-dp 栈完全没验证过，重点是 dp1/dp2 端口起不起、VLAN/桥接是否正常
+- [ ] 内存/稳定性：长跑、重启、无线重载后能否重新建 DS
+
+### D. 清理与决策
+
+- [ ] 决定 `qcom-ppe.ko`（自研 PPE 驱动）去留：DTS 已禁用其节点，但模块还在编、占 322 KiB；
+      去掉可省体积，也能避免两套 PPE 抢硬件
+- [ ] 决定 `qca-nss-ecm` / `qca-nss-sfe` 是否启用（当前 `.config` 未选；ECM 会再加 2-3 MB）
+- [ ] `.config` 新增的 8 个 `CONFIG_PACKAGE_kmod-qca-*` 需要同步到 CI 的 config（`code/LEDE-CI`）
+- [ ] 文档补写：本次全量编译结果、循环依赖最终结论
+
+### E. 已知的构建环境问题（不是代码问题）
+
+- [ ] `libnl-tiny` 下载哈希不匹配（网络中断时触发）→ 临时用 `touch .prepared` 绕过；
+      网络恢复后应 `make package/libs/libnl-tiny/clean` 重新拉一次
+- [ ] `git.openwrt.org` DNS 曾解析失败过，构建前建议先确认网络
+
+### F. 未做但相关
+
+- [ ] `fullcone` 目前是标准 masquerade（`0`），与 DS 无关，用户未要求恢复
+- [ ] 分支 `qca-nss-ds-stack` 已推送 `8e87129c1`；`master` 已推送 `375be58d0`
+
+---
+
+## 14. 有线（ethernet）静态核对结果
+
+### 14.1 现有可用拓扑（旧固件实测）
+
+```
+switch@10 (qca,qca8386, DSA qca8k)
+  port@0 cpu : ethernet=<&ppe_qca8386>, tag=qca_4b, 2500base-x, fixed-link 2500
+  port@1..4  : sgmii + phy-handle qca8386_phy1..4  → lan1/lan2/lan3/wan
+&qcom_ppe ethernet@3a000000 / port@1 (label "switch"): 2500base-x, pcs-handle=<&pcs0_ch0>
+设备实测：switch UP、lan2/lan3 2500、wan 1000、驱动 qca8k
+```
+
+### 14.2 新栈必须补的 4 处（已改）
+
+| # | 改动 | 文件 |
+|---|---|---|
+| 1 | `dp2` 加 label `nss_dp_switch`、`qcom,ppe-offload-disabled=<1>`、`phy-mode` 由 sgmii 改 2500base-x | `ipq5332-qca-nss.dtsi` |
+| 2 | 新增 `ess-instance`：`ess-switch@3a000000`（ipq53xx，mac_mode=0xc）+ `ess-switch1@1`（qca8386/mdio，4 PHY） | 同上 |
+| 3 | DSA CPU 口 `qca8386/port@0.ethernet`：`&ppe_qca8386`（已 disable）→ `&nss_dp_switch` | `ipq5332-common-qca8386.dtsi` |
+| 4 | `ess-switch@3a000000` 的 `reg` 按 `#address-cells=2` 写成 `<0x0 0x3a000000 0x1000000>` | `ipq5332-qca-nss.dtsi` |
+
+### 14.3 静态核对结论（逐项有据）
+
+| 项 | 结论 | 依据 |
+|---|---|---|
+| `switch_mac_mode=0xc` | = `PORT_WRAPPER_SGMII_PLUS`（2.5G SGMII），与 2500 链路一致；`0xf`=`SGMII_CHANNEL0`(PCS0) | `ssdk_init.h` 枚举；`adpt_hppe_portctrl.c:3229` |
+| 时钟表 | **必须 29 项且顺序与厂商 DTB 一致**（ssdk 按名字取）。nsscc id 14/21/33/32/13/12/30/29/34/31/15/18/22/25/35/36/37/38 与我们头文件完全相同 | `fdt_15.dtb`(AP-MI01.6) 解析 + `qcom,ipq5332-nsscc.h` |
+| 复位表 | 19 项：`ppe_rst`→`NSS_CC_PPE_BCR`(17)、`uniphy0/1_soft_rst`→`GCC_UNIPHY0/1_BCR`(121/124)、XPCS→171/172，余为 nsscc ARES | 参考 DTB + `nsscc-ipq5332.c` `qcom_reset_map` |
+| `port_scheduler_resource/config` | 可选，缺失只 `SSDK_ERROR` 后 return | `ssdk_dts.c:816/839` |
+| `link-intr-gpio` | 可选，无则轮询。**不要乱抄 GPIO** | `ssdk_dts.c:1228-1230` |
+| nss-dp 与 `phy-mode` | nss-dp 不解析 `phy-mode`，速率由 SSDK 的 `switch_mac_mode` 决定 | `nss_dp_main.c:868-990` |
+| CPU 口速率 | 2500base-X（旧栈实测 lan2/lan3=2500） | 旧 DTS + 设备实测 |
+| WAN | 在交换机 port4，不需要独立 dp1 | 设备实测 `wan@switch` |
+
+### 14.4 静态验证覆盖不到的（必须真机）
+
+- qca8k(DSA) 能否以 nss-dp netdev 为 conduit 正常收发
+- SSDK 是否接受这套 bmp / PHY 地址（看 dmesg）
+- `qca_4b` tag 与 nss-dp conduit 的兼容性
+
+### 14.5 顺带修的构建问题
+
+- **P1**：全量编译在 `package/install` 报 `cannot find dependency kmod-qca-nss-ppe-ds`，
+  真因是 `bin/targets/*/*/packages/Packages` 索引过期（06:39），不是依赖声明错。
+  出镜像前删掉 `Packages*` 让它重新生成即可（已加到构建流程）。
+- **P3**：`qca-nss-dp` 加 `PKG_BUILD_DEPENDS:=qca-ssdk qca-nss-ppe`，把编序钉成
+  `ssdk → ppe → dp → ppe-ds → ppe-vp`，消除包级循环依赖导致的编序不确定。
