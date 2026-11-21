@@ -24,7 +24,7 @@
 
 		button-wps {
 			label = "wps";
-			gpios = <&tlmm 31 GPIO_ACTIVE_LOW>;
+			gpios = <&tlmm 35 GPIO_ACTIVE_LOW>;
 			linux,code = <KEY_WPS_BUTTON>;
 			debounce-interval = <60>;
 		};
@@ -212,7 +212,10 @@
 
 &tlmm {
 	button_pins: button-pins {
-		pins = "gpio31", "gpio32";
+		/* gpio35 是原厂 pinctrl 里配了上拉的那根：实测按 WPS 时
+		 * gpio31/32 电平不变，说明真实按键不在这两根上。三根都配成
+		 * 上拉输入，按下接地才观察得到电平变化。 */
+		pins = "gpio31", "gpio32", "gpio35";
 		function = "gpio";
 		drive-strength = <8>;
 		bias-pull-up;

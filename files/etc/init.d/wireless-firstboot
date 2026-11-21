@@ -13,30 +13,36 @@
 # every boot is therefore safe and also repairs a config that was generated
 # while only some of the phys were registered.
 #
-# ath12k probes its radios roughly 10-15 s into boot, well after rcS reaches
-# this script, so wait for a wiphy before asking for the configuration.
+# ath12k probes its radios roughly 10-15 s into boot, so the wait would sit in
+# front of rcS and delay everything after it (rc.local, the boot LED, the
+# "done" state) by that much.  Do the waiting in the background instead: rcS
+# finishes immediately and the radios come up as soon as they are ready.
 
 START=99
 STOP=01
+USE_PROCD=1
 
-boot() {
-	[ -x /sbin/wifi ] || return 0
-
-	# Wait for the first wiphy; without it "wifi config" would create an empty
-	# /etc/config/wireless and report nothing.
+# 后台等待射频就绪后生成配置，不阻塞 rcS
+wait_and_config() {
 	local i=0
+
 	while [ $i -lt 40 ]; do
 		[ -n "$(ls /sys/class/ieee80211 2>/dev/null)" ] && break
 		sleep 1
 		i=$((i + 1))
 	done
-	[ $i -lt 40 ] || return 0
+	[ $i -lt 40 ] || exit 0
 
 	/sbin/wifi config >/dev/null 2>&1
-	[ -s /etc/config/wireless ] || return 0
+	[ -s /etc/config/wireless ] || exit 0
 
 	ubus call network reload >/dev/null 2>&1
 	/sbin/wifi up >/dev/null 2>&1
+}
+
+boot() {
+	[ -x /sbin/wifi ] || return 0
+	wait_and_config &
 }
 
 start() { boot; }
