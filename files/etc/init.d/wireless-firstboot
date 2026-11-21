@@ -1,0 +1,33 @@
+#!/bin/sh /etc/rc.common
+# Generate the factory wireless configuration once, on a system that has none.
+#
+# uci-defaults cannot do this: they run before ath12k has probed its radios
+# (about 10-15 s into boot), so "wifi config" would only create an empty file
+# and the radios would never appear in it.  The ieee80211 hotplug handler has
+# the opposite problem: it depends on a uevent that is not reliably delivered
+# this early in boot.  Wait for the first wiphy here and generate the config
+# from the radios that actually exist.  An existing /etc/config/wireless is
+# never touched, so user settings survive sysupgrade.
+
+START=99
+STOP=01
+
+boot() {
+	[ -s /etc/config/wireless ] && return 0
+
+	local i=0
+	while [ $i -lt 40 ]; do
+		[ -n "$(ls /sys/class/ieee80211 2>/dev/null)" ] && break
+		sleep 1
+		i=$((i + 1))
+	done
+
+	/sbin/wifi config >/dev/null 2>&1
+	[ -s /etc/config/wireless ] || return 0
+
+	ubus call network reload >/dev/null 2>&1
+	/sbin/wifi up >/dev/null 2>&1
+	logger -t wireless-firstboot "generated the factory wireless config"
+}
+
+start() { boot; }
