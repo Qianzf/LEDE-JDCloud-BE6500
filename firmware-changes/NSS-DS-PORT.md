@@ -459,3 +459,60 @@ switch@10 (qca,qca8386, DSA qca8k)
   出镜像前删掉 `Packages*` 让它重新生成即可（已加到构建流程）。
 - **P3**：`qca-nss-dp` 加 `PKG_BUILD_DEPENDS:=qca-ssdk qca-nss-ppe`，把编序钉成
   `ssdk → ppe → dp → ppe-ds → ppe-vp`，消除包级循环依赖导致的编序不确定。
+
+---
+
+## 15. 第二轮静态分析（ath12k ↔ nss-ppe）
+
+方法：把 `patches-qualcommbe/` 下的 build/subsys/ath/ath12k 全部补丁按 Makefile 顺序
+应用到纯净 `backports-7.2`（0 失败），再逐行对照 `qca-nss-dp` / `qca-nss-ppe` 源码。
+
+### 15.1 查出的 6 个致命缺陷（5 个已修、1 个已改配置）
+
+| # | 缺陷 | 后果 | 证据 | 处理 |
+|---|---|---|---|---|
+| W1 | `refill` 要求 `size == 2048`，nss-dp 传 1856/1984（页池 1728） | 一个 buffer 都供不出，DS 全死 | `nss_dp_dev.h:92-99` | 改为 `size > 2048` 才拒绝 |
+| W2 | 未预留 headroom（nss-dp 要 128+NET_IP_ALIGN≈130） | 载荷越界 / 帧头被覆盖 | `edma_ppeds.c:1135`、`edma_rx.h:16`；QCA `skb_reserve(headroom)` | 新增 `ATH12K_DS_HEADROOM 192` + 超限拒绝并告警 |
+| W3 | `service_status_update(node, true)` 实际是**置 STOP 位**，热路径每次调用 | 服务一跑就停 | `edma_ppeds.c:1696` `set_bit(EDMA_PPEDS_SERVICE_STOP_BIT)` | 热路径删除；start 后 `false`、stop 前 `true` |
+| W4 | 批量硬截断 32 | 每次 `edma_warn` + 补环慢 | `edma_ppeds.c:1156` | 改为循环填满 |
+| W5 | 丢弃注册返回的 `ppe2tcl_start_idx`/`reo2ppe_start_idx` | WMAC 环与 PPE 环起始索引不一致 | QCA `wifi7/ppeds.c:429`；`ath12k_ds_start_indices()` | 注册后调用 |
+| W6 | 默认**中断模式**，而中断模式要求 WLAN 侧 PPEDS 中断 | 索引同步无人驱动，RS 停死 | `ppe_ds_main.c:34`、`ppe_ds.c:547`；QCA `ath12k_hif_ppeds_irq_enable` | **改默认值为轮询模式**（`007-ppe-ds-default-to-polling-mode.patch`） |
+
+轮询模式依据：`idx_mgmt_freq=32768` → hrtimer 周期约 30.5 µs，双向索引都在 `ppe_ds_timer`
+里同步；nss-dp 侧在轮询模式下改用自己的 NAPI（`edma_ppeds.c:1005`），不依赖缺失的中断。
+
+### 15.2 核对通过的项（不会崩的地方）
+
+- vendored 4 个头与**实际编译的** nss-ppe `01fa40d7` 逐字节一致（仅 include 引号）
+- 调用的 10 个符号全部 `EXPORT_SYMBOL`；`ath12k_wifi7.ko` 的 `depends=` 含 `qca-nss-ppe-ds/-vp`
+- `desc_id` 为 `u32` → `release_tx_desc_single(u32 cookie)` 截断无损
+- `get_wlan_arch_mode()` 返回 7 = `PPE_DS_WIFI_ARCH_MODE_WIFI7`
+- 完成环 `HAL_WBM2SW_DS_RING_NUM=6` 与 QCA `HAL_WBM2SW_PPEDS_TX_CMPLN_RING_NUM=6` 一致
+- `ppe_ds_wlan_rx()` 在轮询模式下由 hrtimer 覆盖，无需调用
+- `dp_ppeds_node_id` nss-ppe 不读，填 node id 无害
+
+### 15.3 有线静态核对（补充）
+
+| 项 | 结论 |
+|---|---|
+| DSA 能否找到 nss-dp 作 conduit | ✅ `of_dev_node_match` 沿 parent 链匹配，nss-dp 有 `SET_NETDEV_DEV` |
+| `qca_4b` tag | ✅ `net/dsa/tag_qca.c` 注册 |
+| PHY 复位归属 | 我们只有 `phy-reset-gpios`（复数，qca8k 用）；ssdk 找单数 `phy-reset-gpio` → **刻意不加**，避免两驱动抢复位 |
+| qca8k 与 ssdk 双重配置 PHY | ⚠️ 只能真机验证；参考移植也是两者共存 |
+| `switch_lan_bmp=0x1e` | ssdk 视角把 WAN 当 LAN（DSA 负责 netdev），影响限于 PPE 内部流表 |
+
+### 15.4 关键前提发现
+
+QCA 的 DS 启用点（`wifi7/dp.c:687-694`）要求 `ab->hw_params->ds_support`，
+而 `ipq5332 hw1.0` 是 `ds_support = false`（`wifi7/hw.c:1061`）。
+
+- **QCA 自己的 ath12k 在 IPQ5332 上从不启用 PPEDS DS**
+- 第三方 BE6500 移植**也未修改该标志**（其 DTS 的 `qcom,ppeds-num=<2>` 只配置 EDMA 节点）
+- 我们的实现用自己的白名单放行了 IPQ5332 —— 这条路径**没有任何参考实现**，风险全自负
+
+### 15.5 仍需真机确认
+
+1. 轮询模式下 2.4G/5G 的 DS 能否真正建立并跑流量
+2. `ath12k_ds_refill` 在 1856/1984 尺寸下的实际行为（buffer 池 2048 × 192 headroom）
+3. `enable_tx_consume_intr` 空实现在轮询模式下是否真的无影响
+4. qca8k 与 ssdk 同时配置 PHY 是否会导致链路抖动

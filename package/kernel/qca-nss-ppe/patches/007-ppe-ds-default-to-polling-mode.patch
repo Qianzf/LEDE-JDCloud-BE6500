@@ -1,0 +1,27 @@
+From: ViKing <viking.yfy@qq.com>
+Subject: [PATCH] ppe_ds: default to polling mode
+
+The PPE-DS index synchronisation runs either from a hrtimer (polling) or from
+a pair of interrupts.  Interrupt mode needs the WLAN driver to register a
+PPEDS interrupt and to implement the tx-consume-intr callback, which ath12k
+only does through QSDK's private hif helpers -- the mainline ath12k has no
+such thing, so in interrupt mode nobody ever reports "WLAN consumed the
+descriptors", nss-ppe waits for that event forever and the Direct Switch
+stops after the first ring wrap.
+
+Default to polling mode (hrtimer, IDX_MGMT_PERIOD is derived from the
+idx_mgmt_freq module parameter) so that the index sync works with the
+callbacks ath12k already provides.  It can still be overridden at load time
+with qca-nss-ppe-ds.polling_for_idx_update=0 once the interrupt path exists.
+
+--- a/drv/ppe_ds/ppe_ds_main.c
++++ b/drv/ppe_ds/ppe_ds_main.c
+@@ -31,7 +31,7 @@
+  * and PPE_DS_POLL_MODE (1) will use polling mode.
+  *
+  */
+-unsigned int polling_for_idx_update = PPE_DS_INTR_MODE;
++unsigned int polling_for_idx_update = PPE_DS_POLL_MODE;
+ module_param(polling_for_idx_update,
+ 		uint, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+ MODULE_PARM_DESC(polling_for_idx_update, "Enable/Disable PPE DS poll mode");
