@@ -516,3 +516,67 @@ QCA 的 DS 启用点（`wifi7/dp.c:687-694`）要求 `ab->hw_params->ds_support`
 2. `ath12k_ds_refill` 在 1856/1984 尺寸下的实际行为（buffer 池 2048 × 192 headroom）
 3. `enable_tx_consume_intr` 空实现在轮询模式下是否真的无影响
 4. qca8k 与 ssdk 同时配置 PHY 是否会导致链路抖动
+
+---
+
+## 16. 第三～五轮静态分析汇总（ath12k ↔ nss-ppe / 有线）
+
+方法固定：把 `patches-qualcommbe/` 下 build/subsys/ath/.../ath12k 全部补丁按 Makefile
+顺序应用到纯净 `backports-7.2`（每次都要求 **0 失败**），再逐行对照 qca-nss-dp /
+qca-nss-ppe / QCA wlan-open 源码与参考 DTB。
+
+### 16.1 无线：累计 9 个致命缺陷，全部已修
+
+| # | 缺陷 | 后果 | 证据 | 修复 |
+|---|---|---|---|---|
+| W1 | `refill` 要求 `size == 2048` | nss-dp 传 1856/1984 → 一个 buffer 都不给 → DS 全死 | `nss_dp_dev.h:92-99` | 改为 `size > 2048` 才拒绝 |
+| W2 | 未预留 headroom | 载荷越界（nss-dp 要 128+NET_IP_ALIGN≈130） | `edma_ppeds.c:1135`、`edma_rx.h:16` | `ATH12K_DS_HEADROOM 192` + 超限拒绝 |
+| W3 | `service_status_update(node, true)` 实为置 STOP 位 | 服务一跑就停 | `edma_ppeds.c:1696` | 热路径删除；start 后 `false`、stop 前 `true` |
+| W4 | 批量硬截断 32 | `edma_warn` 刷屏 + 补环慢 | `edma_ppeds.c:1156` | 循环填满 |
+| W5 | 丢弃注册返回的 `ppe2tcl_start_idx`/`reo2ppe_start_idx` | WMAC 环与 PPE 环起始索引不一致 | QCA `wifi7/ppeds.c:429` | 注册后调 `ath12k_ds_start_indices()` |
+| W6 | 默认中断模式但缺 WLAN 侧 PPEDS 中断 | 索引同步无人驱动 | `ppe_ds_main.c:34` | **模块默认改轮询**（补丁 007） |
+| W7 | `vpai.core_mask = 0` | DS flow 走 `PPE_DRV_SC_VP_RPS` → **送 CPU，等于没直通** | `ppe_drv_flow.c:1245`、`ppe_vp.c:471` | 2G=0x2 / 5G=0x1（与 nss-ppe 默认一致） |
+| W8 | 只带 `USR_TYPE` 的 cfg_update 被静默丢弃 | 路由回 CPU 从未生效 | `ppe_drv_vp.c:130-134`（用 core_mask 门控 user_type） | 同时带 `USR_TYPE\|CORE_MASK` |
+| W9 | VP 表按自己的槽位索引 | 硬件表按 VP 号索引 → 表内容错位 | QCA `wifi7/hal.c:892` | 按 `port` 索引（写入/清除两处） |
+| W10 | `release_tx_desc_single` 接到 RX 回收函数 | TX cookie 过不了 magic 校验 → `faulted` | `ath12k_ds_release()` | 改为空实现（TX buffer 由完成环回收） |
+
+### 16.2 无线：验证通过的机制（不会再崩）
+
+- 头文件 ABI 与实际编译的 nss-ppe `01fa40d7` 逐字节一致；10 个符号全部导出
+- `desc_id` 为 u32 → cookie 截断无损；`wifi_arch_mode=7` 正确
+- DS 三条环由 `ath12k_dp_srng_calculate_msi_group()` 路由到 **MSI group 0**，
+  依赖 `dp->ds` 在建环前已赋值（`ds_setup` 顺序已核）
+- 环 `max_size=0xfffff`，2048 不会被裁剪
+- 完成环 `HAL_WBM2SW_DS_RING_NUM=6` == QCA `HAL_WBM2SW_PPEDS_TX_CMPLN_RING_NUM`
+- REO 目的环映射 `bits[27:24]=11` == QCA `REO2PPE_DST_RING_MAP`
+- peer WMI 结构 `{tlv, mac, routing, service_code, priority_valid, src_info, vdev_id}`
+  与 QCA 逐字段一致；取值 0/1/2 对应 QCA 枚举
+- VP 表位布局 `7:0=VP_NUM, 9:8=PMAC(3), 15:10=BANK, 23:16=VDEV` 与 QCA 一致
+- TX 描述符池 32768，DS 占 2048（≈6%），不会饿死普通 TX
+- DS 初始化失败只 `ath12k_warn`，不影响 WiFi 起来；失败清理会 `dp->ds = NULL`
+- `ath12k_ds_tcl_cons()` 读硬件写回地址，摘流循环不会死等
+- 轮询模式下 RxFill 中断由 nss-dp 无条件申请，补环正常
+
+### 16.3 无线：仍需真机确认
+
+1. 轮询模式 hrtimer 与我们的回调是否真正配合
+2. **VP 所有权模型差异**：QSDK 由外部（nss-dp/ECM）建 VP，ath12k 只 `get_vp_num()` 查；
+   我们自己 `ppe_vp_alloc()`。未启用 ECM 时我们是唯一来源，将来启用 ECM 需重新设计
+3. 2.4G（IPQ5332）DS 能否建立 —— **QCA 自己从不启用**（`ds_support=false`），无参考实现
+
+### 16.4 有线：12 项核对，11 通过
+
+| 项 | 结论 |
+|---|---|
+| DSA conduit 解析 | ✅ `of_dev_node_match` 沿 parent 链匹配，nss-dp 有 `SET_NETDEV_DEV` |
+| `qca_4b` tag | ✅ `net/dsa/tag_qca.c` 注册 |
+| `ess-instance`/`ess-switch`/`ess-switch1` | ✅ 命名与 ssdk 的 `of_find_node_by_name` 对齐 |
+| 29 时钟 / 19 复位 | ✅ 名字与顺序同厂商 DTB；每个 id 在 `gcc-ipq5332.c`/`nsscc-ipq5332.c` 均有注册 |
+| `port_scheduler_*` | ✅ 可选（缺失只 `SSDK_ERROR` 后 return） |
+| `link-intr-gpio` | ✅ 可选；我们**刻意不填**，改 polling |
+| `phy-reset-gpio`（单数） | ✅ 我们只有复数版（qca8k 用），ssdk 不复位 PHY，避免两驱动抢 |
+| PHY 是否在主 mdio | ✅ `__of_mdiobus_parse_phys()` 递归进 `ethernet-phy-package` 把子 PHY 注册到同一总线 → addr 1-4 可访问 |
+| `&qcom_ppe` 覆盖顺序 | ✅ include 顺序使 `status="disabled"` 生效 |
+| `ess-uniphy`/`nss-ppe`/`ppeds-map` | ✅ 与参考 DTB 逐值相同 |
+| `IPQ_NSSCC_QCA8K` | ✅ 实际配置 `=y`（target config 那行被覆盖） |
+| **qca8k 与 ssdk 双 owner PHY** | ⚠️ 只能真机验证 |
