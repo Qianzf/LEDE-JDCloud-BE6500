@@ -92,6 +92,13 @@
 	 * unchanged when PHY4 is attached to the switch MAC4.
 	 */
 	ports {
+		/* The QSDK NSS stack replaces the mainline PPE port, so the DSA CPU
+		 * port follows the nss-dp netdev declared in ipq5332-qca-nss.dtsi.
+		 */
+		port@0 {
+			ethernet = <&nss_dp_switch>;
+		};
+
 		port@1 {
 			label = "lan1";
 			nvmem-cells = <&lan_macaddr 0>;
