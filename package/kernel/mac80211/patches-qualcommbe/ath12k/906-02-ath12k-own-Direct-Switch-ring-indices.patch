@@ -148,7 +148,7 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
 +	       READ_ONCE(ath12k_ab_to_dp(ab)->ds);
 +}
 +
-+#define ATH12K_DS_RING_ENTRIES 1024
++#define ATH12K_DS_RING_ENTRIES 2048
 +#define ATH12K_DS_BUFFER_COUNT 2048
 +#define ATH12K_DS_BUFFER_SIZE 2048
 +#define ATH12K_DS_VP_COUNT 8
