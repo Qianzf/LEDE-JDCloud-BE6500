@@ -1,0 +1,107 @@
+From: ViKing <viking.yfy@qq.com>
+Subject: [PATCH] dnsmasq: move a misplaced OPT record to the end of the reply
+
+--- a/src/forward.c
++++ b/src/forward.c
+@@ -693,6 +693,90 @@
+ }
+ #endif
+ 
++/* Return a pointer past the (possibly compressed) name at p, or NULL if the
++   message is not valid. */
++static unsigned char *skip_reply_name(unsigned char *p, unsigned char *end)
++{
++  while (p < end && *p)
++    {
++      if ((*p & 0xc0) == 0xc0)
++	return (p + 2 <= end) ? p + 2 : NULL;
++      if (*p & 0xc0)
++	return NULL;
++      p += 1 + *p;
++    }
++
++  return (p + 1 <= end) ? p + 1 : NULL;
++}
++
++/* Move the OPT pseudo-RR to the end of the message if it is not already there.
++   RFC 6891 keeps the OPT RR in the additional section, i.e. last.  A reply
++   that carries it earlier is malformed: strict resolvers reject the whole
++   message ("Got bad packet: FORMERR") and our own parser, which walks the
++   sections by the header counts, takes the OPT for the first answer and sees
++   no address at all, turning a good reply into NODATA.
++
++   Relocating the record (rather than deleting it) keeps the answer, authority
++   and additional counts exactly as they arrived, which is what the records
++   after the misplaced OPT already assume.  Returns the (unchanged) length. */
++static size_t normalise_opt_position(struct dns_header *header, size_t plen)
++{
++  unsigned char *base = (unsigned char *)header;
++  unsigned char *end = base + plen;
++  unsigned char *p = base + sizeof(*header);
++  unsigned char *opt = NULL, *opt_end = NULL, *tmp;
++  int i, qd = ntohs(header->qdcount);
++  int total = ntohs(header->ancount) + ntohs(header->nscount) + ntohs(header->arcount);
++  size_t opt_len, tail;
++
++  if (total == 0)
++    return plen;
++
++  for (i = 0; i < qd; i++)
++    {
++      if (!(p = skip_reply_name(p, end)) || p + 4 > end)
++	return plen;
++      p += 4;
++    }
++
++  for (i = 0; i < total; i++)
++    {
++      unsigned char *start = p, *q;
++      int type, rdlen;
++
++      if (!(q = skip_reply_name(p, end)) || q + 10 > end)
++	return plen;
++
++      type = (q[0] << 8) | q[1];
++      rdlen = (q[8] << 8) | q[9];
++      p = q + 10 + rdlen;
++      if (p > end)
++	return plen;
++
++      if (type == T_OPT)
++	{
++	  opt = start;
++	  opt_end = p;
++	}
++    }
++
++  if (!opt || opt_end == end)
++    return plen;
++
++  opt_len = opt_end - opt;
++  tail = end - opt_end;
++
++  if (!(tmp = whine_malloc(opt_len)))
++    return plen;
++
++  memcpy(tmp, opt, opt_len);
++  memmove(opt, opt_end, tail);
++  memcpy(opt + tail, tmp, opt_len);
++  free(tmp);
++
++  return plen;
++}
++
+ static size_t process_reply(struct dns_header *header, time_t now, struct server *server, size_t n, int check_rebind, 
+ 			    int no_cache, int cache_secure, int bogusanswer, int ad_reqd, int do_bit, int added_pheader, 
+ 			    union mysockaddr *query_source, size_t outlen, int ede)
+@@ -705,6 +789,10 @@
+     
+   (void)ad_reqd;
+   (void)do_bit;
++
++  /* A reply whose OPT record is not last is malformed; put it in place before
++     anything else looks at the message. */
++  n = normalise_opt_position(header, n);
+  
+ #if defined(HAVE_IPSET) || defined(HAVE_NFTSET)
+   if ((daemon->ipsets || daemon->nftsets) && extract_name(header, n, NULL, daemon->namebuff, EXTR_NAME_EXTRACT, 0))
