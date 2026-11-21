@@ -1,0 +1,18 @@
+From: Qianzf <qianzf@example.com>
+Subject: [PATCH] qca-ssdk: keep -Wmissing-prototypes from breaking the build
+
+The SSDK sources are full of non-static helpers that are exported through
+tables without prototypes.  Toolchains newer than the one QSDK is built
+with enable -Wmissing-prototypes/-Wmissing-declarations by default, which
+-Werror then turns into a hard error.  Disable those two warnings.
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+--- a/mk/cflags.mk	2026-07-20 11:22:55.000000000 +0800
++++ b/mk/cflags.mk	2026-11-21 10:38:47.133246048 +0800
+@@ -499,4 +499,4 @@
+ #############################################
+ #            combine all cflags
+ #############################################
+-ccflags-y += ${MODULE_INC} ${MODULE_CFLAG} -DFALLTHROUGH -Werror -Wall
++ccflags-y += ${MODULE_INC} ${MODULE_CFLAG} -DFALLTHROUGH -Werror -Wall -Wno-missing-prototypes -Wno-missing-declarations

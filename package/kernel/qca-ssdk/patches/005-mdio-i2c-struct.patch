@@ -1,0 +1,27 @@
+From: Qianzf <qianzf@example.com>
+Subject: [PATCH] qca-ssdk: declare the mdio i2c bus data locally
+
+The SFP i2c path refers to struct qcom_mdio_i2c_data which only the
+QSDK mdio-ipq4019 driver exports.  Declare the single member it uses;
+the path is dormant on boards without an SFP cage.
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+--- a/src/hsl/phy/sfp_phy.c	2026-07-20 11:22:55.000000000 +0800
++++ b/src/hsl/phy/sfp_phy.c	2026-11-21 10:47:04.860631587 +0800
+@@ -28,6 +28,15 @@
+ #include <linux/phylink.h>
+ #include <linux/sfp.h>
+ 
++/*
++ * The QSDK mdio-ipq4019 driver exports this struct for the SFP i2c path.
++ * Mainline keeps the structure private, so declare the one member used
++ * here; this board has no SFP cage and the path stays dormant.
++ */
++struct qcom_mdio_i2c_data {
++	struct i2c_adapter *i2c;
++};
++
+ static a_bool_t sfp_phy_drv_registered = A_FALSE;
+ 
+ static int sfp_eeprom_i2c_read(struct phy_device *phydev, u32 bus_addr,

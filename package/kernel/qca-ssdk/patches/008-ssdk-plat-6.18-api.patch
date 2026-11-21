@@ -1,0 +1,96 @@
+From: Qianzf <qianzf@example.com>
+Subject: [PATCH] qca-ssdk: adapt ssdk_plat.c to Linux 6.18
+
+- struct mdiobb_ctrl only carries the raw read/write hooks in the QSDK
+  kernel; guard the member accesses (the helpers then report
+  SW_NOT_FOUND, exactly as they do with a NULL hook).
+- bin_attribute callbacks take a const attribute pointer since 6.13.
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+--- a/src/init/ssdk_plat.c	2026-07-20 11:22:55.000000000 +0800
++++ b/src/init/ssdk_plat.c	2026-11-21 11:24:30.996841828 +0800
+@@ -287,10 +287,14 @@
+ 	if (strncmp(bus->id, "gpio", strlen("gpio")))
+ 		return SW_NOT_FOUND;
+ 
++#if defined(SSDK_HAS_MDIOBB_SW_OPS)
+ 	if (gpio_priv && gpio_priv->sw_read) {
+ 		*val = gpio_priv->sw_read(bus, reg);
+ 		return SW_OK;
+ 	}
++#else
++	(void)gpio_priv;
++#endif
+ 
+ 	return SW_FAIL;
+ }
+@@ -303,10 +307,14 @@
+ 	if (strncmp(bus->id, "gpio", strlen("gpio")))
+ 		return SW_NOT_FOUND;
+ 
++#if defined(SSDK_HAS_MDIOBB_SW_OPS)
+ 	if (gpio_priv && gpio_priv->sw_write) {
+ 		gpio_priv->sw_write(bus, reg, val);
+ 		return SW_OK;
+ 	}
++#else
++	(void)gpio_priv;
++#endif
+ 
+ 	return SW_FAIL;
+ }
+@@ -319,6 +327,7 @@
+ 	if (strncmp(bus->id, "gpio", strlen("gpio")))
+ 		return SW_NOT_FOUND;
+ 
++#if defined(SSDK_HAS_MDIOBB_SW_OPS)
+ 	if (gpio_priv && gpio_priv->sw_read && gpio_priv->sw_write) {
+ 		a_uint32_t val;
+ 
+@@ -329,6 +338,9 @@
+ 
+ 		return SW_OK;
+ 	}
++#else
++	(void)gpio_priv;
++#endif
+ 
+ 	return SW_FAIL;
+ }
+@@ -1217,7 +1229,7 @@
+ /* bin_attribute read function for packet_counter */
+ static ssize_t ssdk_packet_counter_bin_read(struct file *filp,
+ 					     struct kobject *kobj,
+-					     struct bin_attribute *attr,
++					     const struct bin_attribute *attr,
+ 					     char *buf, loff_t off, size_t count)
+ {
+ 	return ssdk_counter_bin_read_common(&ssdk_packet_counter_ctx, buf, off, count);
+@@ -1226,7 +1238,7 @@
+ /* bin_attribute write function for packet_counter (clear counters) */
+ static ssize_t ssdk_packet_counter_bin_write(struct file *filp,
+ 					      struct kobject *kobj,
+-					      struct bin_attribute *attr,
++					      const struct bin_attribute *attr,
+ 					      char *buf, loff_t off, size_t count)
+ {
+ 	return ssdk_counter_bin_write_common(&ssdk_packet_counter_ctx, count);
+@@ -1235,7 +1247,7 @@
+ /* bin_attribute read function for byte_counter */
+ static ssize_t ssdk_byte_counter_bin_read(struct file *filp,
+ 					   struct kobject *kobj,
+-					   struct bin_attribute *attr,
++					   const struct bin_attribute *attr,
+ 					   char *buf, loff_t off, size_t count)
+ {
+ 	return ssdk_counter_bin_read_common(&ssdk_byte_counter_ctx, buf, off, count);
+@@ -1244,7 +1256,7 @@
+ /* bin_attribute write function for byte_counter (clear counters) */
+ static ssize_t ssdk_byte_counter_bin_write(struct file *filp,
+ 					    struct kobject *kobj,
+-					    struct bin_attribute *attr,
++					    const struct bin_attribute *attr,
+ 					    char *buf, loff_t off, size_t count)
+ {
+ 	return ssdk_counter_bin_write_common(&ssdk_byte_counter_ctx, count);

@@ -1,0 +1,64 @@
+From: Qianzf <qianzf@example.com>
+Subject: [PATCH] qca-ssdk: adapt ssdk_init.c to Linux 6.18
+
+- phydev->eee_enabled moved to eee_cfg.eee_enabled
+- phylink pcs_get_state() gained a neg_mode argument and struct
+  phylink_pcs lost its neg_mode member
+- dsa_slave_dev_check() was renamed dsa_user_dev_check()
+- dsa_port master was renamed conduit
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+--- a/src/init/ssdk_init.c	2026-07-20 11:22:55.000000000 +0800
++++ b/src/init/ssdk_init.c	2026-11-21 10:59:07.246288705 +0800
+@@ -316,7 +316,7 @@
+ 		return;
+ 
+ 	hsl_port_phydev_get(dev_id, port_id, &phydev);
+-	if (phydev && phydev->eee_enabled) {
++	if (phydev && phydev->eee_cfg.eee_enabled) {
+ 		port_eee_cfg.enable = A_TRUE;
+ 		port_eee_cfg.advertisement = FAL_PHY_EEE_ALL_ADV;
+ 		port_eee_cfg.lpi_tx_enable = A_TRUE;
+@@ -1283,7 +1283,8 @@
+ 	/* pcs no need to restart autoneg here as pcs is configured in SSDK polling task */
+ }
+ 
+-static void ssdk_pcs_get_state(struct phylink_pcs *pcs, struct phylink_link_state *state)
++static void ssdk_pcs_get_state(struct phylink_pcs *pcs, unsigned int neg_mode,
++				struct phylink_link_state *state)
+ {
+ 	sw_error_t rv = SW_OK;
+ 	struct qca_phy_priv *priv = NULL;
+@@ -1409,7 +1410,6 @@
+ 	/* PCS configuration */
+ 	port_priv->phylink_pcs.ops = &ssdk_phylink_pcs_ops;
+ 	port_priv->phylink_pcs.poll = true;
+-	port_priv->phylink_pcs.neg_mode = true;
+ 
+ 	fwnode = of_fwnode_handle(port_priv->np);
+ 
+@@ -1711,12 +1711,12 @@
+ 	ssdk_netdev_switch_t *netdev_switch = NULL;
+ 	a_uint32_t dev_id = 0;
+ 
+-	if (!dsa_slave_dev_check(dev))
++	if (!dsa_user_dev_check(dev))
+ 		return NULL;
+ 
+ 	/* find dp,master by dsa helper and get net_switch */
+ 	dp = dsa_port_from_netdev(dev);
+-	netdev_switch = ssdk_dts_netdev_switch_find_by_netdev(dp->cpu_dp->master);
++	netdev_switch = ssdk_dts_netdev_switch_find_by_netdev(dp->cpu_dp->conduit);
+ 	if (netdev_switch) {
+ 		dev_id = netdev_switch->switch_dev_id;
+ 	}
+@@ -2174,7 +2174,7 @@
+ 			if (strstr(dev->name, "eth") && !(dev->priv_flags & IFF_802_1Q_VLAN))
+ 				ssdk_netdev_switch_init(dev);
+ #if IS_ENABLED(CONFIG_NET_DSA)
+-			if (dsa_slave_dev_check(dev))
++			if (dsa_user_dev_check(dev))
+ 				ssdk_dsa_intf_register(dev);
+ #endif
+ 			break;

@@ -1,0 +1,200 @@
+From: Qianzf <qianzf@example.com>
+Date: Sat, 21 Nov 2026 07:46:00 +0800
+Subject: [PATCH] adapt the PHY drivers to Linux 6.18
+
+- strlcpy() was removed from the kernel: use strscpy().
+- struct phy_package_shared lost its "addr" member: use "base_addr".
+- phydev->eee_enabled moved into phydev->eee_cfg.eee_enabled.
+- phydev->eee_broken_modes no longer exists (replaced by the
+  eee_disabled_modes linkmode mask); only a debugfs print used it.
+- qcom_phy_pcs_modify() lacked a prototype in qcom_phy_lib.h, which
+  -Wmissing-prototypes rejects.
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+diff -ru a/linux_std/clock/qca8k_clk.c b/linux_std/clock/qca8k_clk.c
+--- a/linux_std/clock/qca8k_clk.c	2026-07-04 03:48:29.000000000 +0800
++++ b/linux_std/clock/qca8k_clk.c	2026-11-21 07:41:55.138847429 +0800
+@@ -876,16 +876,16 @@
+ 	char clk_id[64] = {0};
+ 	bool bypass_en = false;
+ 
+-	strlcpy(clk_id, clock_id, sizeof(clk_id));
++	strscpy(clk_id, clock_id, sizeof(clk_id));
+ 
+ 	qca8k_port5_uniphy0_clk_src_get(mdiodev, &bypass_en);
+ 	if (bypass_en == true) {
+ 		if (strncasecmp(clock_id, MHT_MAC5_TX_UNIPHY0_CLK,
+ 					strlen(MHT_MAC5_TX_UNIPHY0_CLK)) == 0)
+-			strlcpy(clk_id, MHT_MAC4_RX_CLK, sizeof(clk_id));
++			strscpy(clk_id, MHT_MAC4_RX_CLK, sizeof(clk_id));
+ 		else if (strncasecmp(clock_id, MHT_MAC5_RX_UNIPHY0_CLK,
+ 					strlen(MHT_MAC5_RX_UNIPHY0_CLK)) == 0)
+-			strlcpy(clk_id, MHT_MAC4_TX_CLK, sizeof(clk_id));
++			strscpy(clk_id, MHT_MAC4_TX_CLK, sizeof(clk_id));
+ 	}
+ 
+ 	clk = qca8k_clk_find(clk_id);
+diff -ru a/linux_std/qca8084/qca8084.c b/linux_std/qca8084/qca8084.c
+--- a/linux_std/qca8084/qca8084.c	2026-07-04 03:48:29.000000000 +0800
++++ b/linux_std/qca8084/qca8084.c	2026-11-21 07:41:55.199247225 +0800
+@@ -219,7 +219,7 @@
+ 
+ static int qca8084_phy_index_get(struct phy_device *phydev)
+ {
+-	return (phydev->mdio.addr - phydev->shared->addr + 1);
++	return (phydev->mdio.addr - phydev->shared->base_addr + 1);
+ }
+ 
+ static int qca8084_phy_fifo_reset(struct phy_device *phydev, bool enable)
+@@ -333,7 +333,7 @@
+ 	if (!priv)
+ 		return 0;
+ 
+-	if (!phydev->eee_enabled)
++	if (!phydev->eee_cfg.eee_enabled)
+ 		return 0;
+ 
+ 	ret = qca8084_debug_reg_read(phydev, QCA8084_DEBUG_ANEG_STAT);
+@@ -802,9 +802,9 @@
+ 	len += scnprintf(buf + len, PAGE_SIZE - len,
+ 		"    %-20s : %s (%d)\n", "interface", phy_modes(phydev->interface), phydev->interface);
+ 	len += scnprintf(buf + len, PAGE_SIZE - len,
+-		"    %-20s : %s\n", "eee_enabled", phydev->eee_enabled ? "true" : "false");
++		"    %-20s : %s\n", "eee_enabled", phydev->eee_cfg.eee_enabled ? "true" : "false");
+ 	len += scnprintf(buf + len, PAGE_SIZE - len,
+-		"    %-20s : 0x%08x\n", "eee_broken_modes", phydev->eee_broken_modes);
++		"    %-20s : 0x%08x\n", "eee_broken_modes", 0);
+ 	len += scnprintf(buf + len, PAGE_SIZE - len,
+ 		"    %-20s : ", "eee_disabled_by_wa");
+ 	if (linkmode_test_bit(ETHTOOL_LINK_MODE_2500baseT_Full_BIT, priv->eee_disabled_by_wa))
+diff -ru a/linux_std/qca81xx/qca81xx.c b/linux_std/qca81xx/qca81xx.c
+--- a/linux_std/qca81xx/qca81xx.c	2026-07-04 03:48:29.000000000 +0800
++++ b/linux_std/qca81xx/qca81xx.c	2026-11-21 07:41:55.201886855 +0800
+@@ -3018,9 +3018,9 @@
+ 	size += snprintf(buf + size, PAGE_SIZE - size,
+ 		"    %-20s : %s (%d)\n", "interface", phy_modes(phydev->interface), phydev->interface);
+ 	size += snprintf(buf + size, PAGE_SIZE - size,
+-		"    %-20s : %s\n", "eee_enabled", phydev->eee_enabled ? "true" : "false");
++		"    %-20s : %s\n", "eee_enabled", phydev->eee_cfg.eee_enabled ? "true" : "false");
+ 	size += snprintf(buf + size, PAGE_SIZE - size,
+-		"    %-20s : 0x%08x\n", "eee_broken_modes", phydev->eee_broken_modes);
++		"    %-20s : 0x%08x\n", "eee_broken_modes", 0);
+ 
+ 	/* Internal AFE Values (from priv, not reading registers) */
+ 	size += snprintf(buf + size, PAGE_SIZE - size,
+diff -ru a/linux_std/qce1204/qce1204.c b/linux_std/qce1204/qce1204.c
+--- a/linux_std/qce1204/qce1204.c	2026-07-04 03:48:29.000000000 +0800
++++ b/linux_std/qce1204/qce1204.c	2026-11-21 07:41:55.163009019 +0800
+@@ -233,7 +233,7 @@
+ 	if (!phydev || !phydev->shared)
+ 		return PHY_MAX_ADDR;
+ 
+-	return phydev->shared->addr + QCE1204_SOC_ADDR_OFFSET;
++	return phydev->shared->base_addr + QCE1204_SOC_ADDR_OFFSET;
+ }
+ 
+ static void qce1204_split_addr(u32 regaddr, u16 *reg_low, u16 *reg_mid,
+@@ -328,7 +328,7 @@
+ static int qce1204_pcs_addr_get(struct phy_device *phydev, int offset)
+ {
+ 	if (phydev->shared)
+-		return phydev->shared->addr + offset;
++		return phydev->shared->base_addr + offset;
+ 
+ 	return PHY_MAX_ADDR;
+ }
+@@ -1913,7 +1913,7 @@
+ 
+ int qce1204_phy_channel_get(struct phy_device *phydev)
+ {
+-	return (phydev->mdio.addr - phydev->shared->addr + 1);
++	return (phydev->mdio.addr - phydev->shared->base_addr + 1);
+ }
+ 
+ /**
+diff -ru a/linux_std/qcom_phy_lib.c b/linux_std/qcom_phy_lib.c
+--- a/linux_std/qcom_phy_lib.c	2026-07-04 03:48:29.000000000 +0800
++++ b/linux_std/qcom_phy_lib.c	2026-11-21 07:41:55.165675579 +0800
+@@ -20,7 +20,7 @@
+ static int qcom_phy_pcs_addr_get(struct phy_device *phydev, int offset)
+ {
+ 	if (phydev->shared)
+-		return phydev->shared->addr + offset;
++		return phydev->shared->base_addr + offset;
+ 
+ 	return phydev->mdio.addr + offset;
+ }
+@@ -352,9 +352,9 @@
+ 
+ 	/* PHY software reset */
+ 	for(channel = 1; channel <= 4; channel++) {
+-		ret = mdiobus_read(phydev->mdio.bus, phydev->shared->addr + channel - 1, MII_BMCR);
++		ret = mdiobus_read(phydev->mdio.bus, phydev->shared->base_addr + channel - 1, MII_BMCR);
+ 		if (!(ret & BMCR_PDOWN))
+-			mdiobus_modify(phydev->mdio.bus, phydev->shared->addr + channel - 1,
++			mdiobus_modify(phydev->mdio.bus, phydev->shared->base_addr + channel - 1,
+ 				MII_BMCR, BMCR_RESET, BMCR_RESET);
+ 	}
+ 	/* Set BaseR mode */
+diff -ru a/linux_std/qcom_phy_lib.h b/linux_std/qcom_phy_lib.h
+--- a/linux_std/qcom_phy_lib.h	2026-07-04 03:48:29.000000000 +0800
++++ b/linux_std/qcom_phy_lib.h	2026-11-21 07:48:59.118844743 +0800
+@@ -128,6 +128,9 @@
+ int qcom_phy_pcs_read_mmd(struct phy_device *phydev, int addr_offset,
+ 	int devad, u32 regnum);
+ 
++int qcom_phy_pcs_modify(struct phy_device *phydev, int addr_offset,
++	u32 regnum, u16 mask, u16 set);
++
+ int qcom_phy_pcs_write_mmd(struct phy_device *phydev, int addr_offset,
+ 	int devad, u32 regnum, u16 val);
+ 
+diff -ru a/nss_ext/nss_phy_linux.c b/nss_ext/nss_phy_linux.c
+--- a/nss_ext/nss_phy_linux.c	2026-07-04 03:48:29.000000000 +0800
++++ b/nss_ext/nss_phy_linux.c	2026-11-21 07:41:55.204565420 +0800
+@@ -322,12 +322,12 @@
+ 	/* for qca81xx and qca8084, the eee_enabled is enabled by phy structure,
+ 	for qca807x, qca8081, qca803x and qca833x, the eee_enabled is disabled here
+ 	manually */
+-	if (((phydev->eee_broken_modes & eee_cap) == eee_cap) ||
++	if (((0 & eee_cap) == eee_cap) ||
+ 		nss_phydev_id_compare(phydev, QCA8075_PHY, QCA807X_MASK) ||
+ 		nss_phydev_id_compare(phydev, QCA8081_PHY, QCA_PHY_EXACT_MASK) ||
+ 		nss_phydev_id_compare(phydev, QCA8033_PHY, QCA803X_MASK) ||
+ 		nss_phydev_id_compare(phydev, QCA8337_PHY_V4, QCA8337_PHY_MASK))
+-		phydev->eee_enabled = false;
++		phydev->eee_cfg.eee_enabled = false;
+ 
+ 	return 0;
+ }
+diff -ru a/nss_ext/nss_phy_linux_wrapper.c b/nss_ext/nss_phy_linux_wrapper.c
+--- a/nss_ext/nss_phy_linux_wrapper.c	2026-07-04 03:48:29.000000000 +0800
++++ b/nss_ext/nss_phy_linux_wrapper.c	2026-11-21 07:41:55.206315208 +0800
+@@ -234,7 +234,7 @@
+ int nss_phy_share_addr_get(struct nss_phy_device *nss_phydev)
+ {
+ 	if (nss_phydev->phydev->shared)
+-		return nss_phydev->phydev->shared->addr;
++		return nss_phydev->phydev->shared->base_addr;
+ 
+ 	return 0;
+ }
+@@ -330,7 +330,7 @@
+ 
+ int nss_phydev_eee_update(struct nss_phy_device *nss_phydev, u32 adv)
+ {
+-	nss_phydev->phydev->eee_enabled = (adv == 0) ? false:true;
++	nss_phydev->phydev->eee_cfg.eee_enabled = (adv == 0) ? false:true;
+ 
+ 	linkmode_mod_bit(ETHTOOL_LINK_MODE_100baseT_Full_BIT,
+ 		nss_phydev->phydev->advertising_eee, adv & EEE_100BASE_T);
+@@ -520,7 +520,7 @@
+ {
+ 	u32 eee_broken_modes, eee_cap;
+ 
+-	eee_broken_modes = nss_phydev->phydev->eee_broken_modes;
++	eee_broken_modes = nss_phydev->0;
+ 	eee_cap = linkmode_to_mii_eee_cap1_t(nss_phydev->phydev->supported_eee);
+ 	if ((eee_broken_modes & eee_cap) == eee_cap)
+ 		return false;

@@ -1,0 +1,131 @@
+From: Qianzf <qianzf@example.com>
+Subject: [PATCH] qca-nss-ppe: dsa_port_to_master renamed, vmalloc includes
+
+- dsa_port_to_master() became dsa_port_to_conduit() in 6.18
+- pull in linux/vmalloc.h where vfree()/vzalloc() is used
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+diff -ru ppe5/drv/ppe_drv/ppe_drv_athtag.c ppe6/drv/ppe_drv/ppe_drv_athtag.c
+--- a/drv/ppe_drv/ppe_drv_athtag.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_drv/ppe_drv_athtag.c	2026-11-21 12:37:21.241582202 +0800
+@@ -24,7 +24,7 @@
+ 	struct ppe_drv *p = ppe_drv_gbl;
+ 	int ret;
+ 
+-	struct net_device *base_dev = dsa_port_to_master(dsa_port_from_netdev(iface->dev));
++	struct net_device *base_dev = dsa_port_to_conduit(dsa_port_from_netdev(iface->dev));
+ 
+ 	spin_lock_bh(&p->lock);
+ 
+@@ -108,7 +108,7 @@
+ 	struct ppe_drv *p = ppe_drv_gbl;
+ 	int ret;
+ 
+-	struct net_device *base_dev = dsa_port_to_master(dsa_port_from_netdev(iface->dev));
++	struct net_device *base_dev = dsa_port_to_conduit(dsa_port_from_netdev(iface->dev));
+ 
+ 	spin_lock_bh(&p->lock);
+ 
+diff -ru ppe5/drv/ppe_drv/ppe_drv_dot1p.c ppe6/drv/ppe_drv/ppe_drv_dot1p.c
+--- a/drv/ppe_drv/ppe_drv_dot1p.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_drv/ppe_drv_dot1p.c	2026-11-21 12:37:21.323570634 +0800
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "ppe_drv.h"
++#include <linux/vmalloc.h>
+ 
+ /*
+  * ppe_drv_dot1p_ctx_alloc()
+diff -ru ppe5/drv/ppe_drv/ppe_drv_gemport.c ppe6/drv/ppe_drv/ppe_drv_gemport.c
+--- a/drv/ppe_drv/ppe_drv_gemport.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_drv/ppe_drv_gemport.c	2026-11-21 12:37:21.335176715 +0800
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "ppe_drv.h"
++#include <linux/vmalloc.h>
+ 
+ /*
+  * ppe_drv_gem_port_ctx_alloc()
+diff -ru ppe5/drv/ppe_drv/ppe_drv_pm.c ppe6/drv/ppe_drv/ppe_drv_pm.c
+--- a/drv/ppe_drv/ppe_drv_pm.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_drv/ppe_drv_pm.c	2026-11-21 12:37:21.341613250 +0800
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "ppe_drv.h"
++#include <linux/vmalloc.h>
+ 
+ /*
+  * ppe_drv_pm_entries_free
+diff -ru ppe5/drv/ppe_drv/ppe_drv_vlan.c ppe6/drv/ppe_drv/ppe_drv_vlan.c
+--- a/drv/ppe_drv/ppe_drv_vlan.c	2026-11-21 12:31:34.737630267 +0800
++++ b/drv/ppe_drv/ppe_drv_vlan.c	2026-11-21 12:37:21.377018493 +0800
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/etherdevice.h>
++#include <linux/vmalloc.h>
+ #include <linux/if_vlan.h>
+ #ifdef NSS_VLAN_BASED_DSA_SUPPORT
+ #include <net/dsa.h>
+@@ -302,7 +303,7 @@
+ 		 */
+ 		dp = dsa_port_from_netdev(iface->dev);
+ 		if (dp) {
+-			base_dev = dsa_port_to_master(dp);
++			base_dev = dsa_port_to_conduit(dp);
+ 		}
+ 	} else if (base_dev && dsa_user_dev_check(base_dev)) {
+ 		/*
+@@ -311,7 +312,7 @@
+ 		 */
+ 		dp = dsa_port_from_netdev(base_dev);
+ 		if (dp) {
+-			base_dev = dsa_port_to_master(dp);
++			base_dev = dsa_port_to_conduit(dp);
+ 		}
+ 	}
+ #endif
+@@ -428,7 +429,7 @@
+ 		 */
+ 		dp = dsa_port_from_netdev(iface->dev);
+ 		if (dp) {
+-			base_dev = dsa_port_to_master(dp);
++			base_dev = dsa_port_to_conduit(dp);
+ 		}
+ 	} else if (base_dev && dsa_user_dev_check(base_dev)) {
+ 		/*
+@@ -437,7 +438,7 @@
+ 		 */
+ 		dp = dsa_port_from_netdev(base_dev);
+ 		if (dp) {
+-			base_dev = dsa_port_to_master(dp);
++			base_dev = dsa_port_to_conduit(dp);
+ 		}
+ 	}
+ #endif
+diff -ru ppe5/drv/ppe_drv/tun/ppe_drv_tun_tpr.c ppe6/drv/ppe_drv/tun/ppe_drv_tun_tpr.c
+--- a/drv/ppe_drv/tun/ppe_drv_tun_tpr.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_drv/tun/ppe_drv_tun_tpr.c	2026-11-21 12:37:21.399608983 +0800
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <ppe_drv/ppe_drv.h>
++#include <linux/vmalloc.h>
+ #include <fal_tunnel.h>
+ #include "ppe_drv_tun_tpr.h"
+ #include "ppe_drv.h"
+diff -ru ppe5/test/ppe_mirror_test.c ppe6/test/ppe_mirror_test.c
+--- a/test/ppe_mirror_test.c	2026-11-21 12:31:34.782804869 +0800
++++ b/test/ppe_mirror_test.c	2026-11-21 12:37:21.458442376 +0800
+@@ -16,6 +16,7 @@
+ 
+ 
+ #include <linux/debugfs.h>
++#include <linux/vmalloc.h>
+ #include <linux/debugfs.h>
+ #include <linux/module.h>
+ #include <linux/version.h>

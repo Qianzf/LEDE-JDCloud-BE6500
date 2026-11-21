@@ -1,0 +1,19 @@
+From: Qianzf <qianzf@example.com>
+Subject: [PATCH] qca-nss-ppe: consume EXTRA_CFLAGS
+
+Linux 6.18 no longer honours the EXTRA_CFLAGS make variable, so the
+SSDK include paths passed by the OpenWrt package never reached the
+compiler.  Fold them into ccflags-y.
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+--- a/Makefile	2026-08-10 23:31:55.000000000 +0800
++++ b/Makefile	2026-11-21 12:24:35.991396701 +0800
+@@ -1,6 +1,7 @@
+ # Makefile for PPE test modules
+ 
+ ccflags-y := -I$(obj) -I$(obj)/..
++ccflags-y += $(EXTRA_CFLAGS)
+ ccflags-y += -Wall -Werror
+ 
+ export BUILD_ID = \"Build Id: $(shell date +'%m/%d/%y, %H:%M:%S')\"

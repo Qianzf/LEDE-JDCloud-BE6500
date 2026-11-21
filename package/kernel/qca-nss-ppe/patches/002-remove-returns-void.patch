@@ -1,0 +1,33 @@
+From: Qianzf <qianzf@example.com>
+Subject: [PATCH] qca-nss-ppe: platform remove returns void on 6.18
+
+Since 6.18 .remove takes a void-returning callback.
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+--- a/drv/ppe_drv/ppe_drv.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_drv/ppe_drv.c	2026-11-21 12:29:44.054110038 +0800
+@@ -2601,7 +2601,11 @@
+  * ppe_drv_remove()
+  *	remove the ppe driver
+  */
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0))
++static void ppe_drv_remove(struct platform_device *pdev)
++#else
+ static int ppe_drv_remove(struct platform_device *pdev)
++#endif
+ {
+ 	struct ppe_drv *p = platform_get_drvdata(pdev);
+ 	int i = 0;
+@@ -2795,7 +2799,11 @@
+ 	ppe_drv_flow_dump_exit();
+ 	ppe_drv_if_map_exit();
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0))
++	return;
++#else
+ 	return 0;
++#endif
+ }
+ 
+ /*

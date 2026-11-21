@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * QSDK NSS/PPE ethernet stack (nss-dp + nss-ppe + qca-ssdk).
+ *
+ * Replaces the mainline "qcom,ipq5332-ppe" driver so that the PPE Direct
+ * Switch nodes described by the boot firmware can be used by ath12k.
+ * Properties follow the vendor DTB (edma@3ab00000) and the QSDK bindings.
+ */
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+/* the mainline PPE driver cannot share the hardware with nss-dp */
+&qcom_ppe {
+	status = "disabled";
+};
+
+/ {
+	soc@0 {
+		edma@3ab00000 {
+			compatible = "qcom,edma";
+			reg = <0x3ab00000 0xed000>;
+			reg-names = "edma-reg-base";
+			reset-names = "edma_rst";
+			clocks = <&nsscc 7>, <&nsscc 11>, <&nsscc 0>, <&nsscc 1>,
+				 <&nsscc 8>, <&nsscc 9>, <&gcc 0x2c>, <&gcc 0x2e>,
+				 <&gcc 0x2f>, <&gcc 0x30>, <&gcc 0x31>, <&gcc 0xb2>,
+				 <&gcc 0x32>, <&gcc 0x33>, <&gcc 0x34>, <&gcc 0x35>,
+				 <&gcc 0x36>, <&gcc 0x81>, <&gcc 0x80>;
+			clock-names = "nss-csr-clk", "nss-nssnoc-csr-clk",
+				      "nss-ce-ahb-clk", "nss-ce-axi-clk",
+				      "nss-nssnoc-ce-ahb-clk", "nss-nssnoc-ce-axi-clk",
+				      "nss-ts-clk", "nss-nsscc-clk", "nss-nsscfg-clk",
+				      "nss-nssnoc-atb-clk", "nss-nssnoc-nsscc-clk",
+				      "nss-nssnoc-pcnoc-1-clk", "nss-nssnoc-qosgen-ref-clk",
+				      "nss-nssnoc-snoc-1-clk", "nss-nssnoc-snoc-clk",
+				      "nss-nssnoc-timeout-ref-clk", "nss-nssnoc-xo-dcd-clk",
+				      "nss-snoc-nssnoc-clk", "nss-snoc-nssnoc-1-clk";
+
+			qcom,txdesc-ring-start = <4>;
+			qcom,txdesc-rings = <12>;
+			qcom,txcmpl-ring-start = <4>;
+			qcom,txcmpl-rings = <12>;
+			qcom,rxfill-ring-start = <4>;
+			qcom,rxfill-rings = <4>;
+			qcom,rxdesc-ring-start = <12>;
+			qcom,rxdesc-rings = <4>;
+			qcom,rx-page-mode = <0>;
+			qcom,tx-map-priority-level = <1>;
+			qcom,rx-map-priority-level = <1>;
+
+			/* two Direct Switch nodes: one per WLAN radio */
+			qcom,ppeds-num = <2>;
+			qcom,ppeds-map = <1 1 1 1 0x20 0x08
+					  2 2 2 2 0x28 0x08>;
+
+			qcom,txdesc-map = <8 9 10 11 12 13 14 15
+					   4 5 6 7>;
+			qcom,txdesc-fc-grp-map = <1 2>;
+			qcom,rxfill-map = <4 5 6 7>;
+			qcom,rxdesc-map = <12 13 14 15>;
+			qcom,rx-queue-start = <0>;
+			qcom,rx-ring-queue-map = <0 8 0x10 0x18  1 9 0x11 0x19
+						  2 10 0x12 0x1a  3 11 0x13 0x1b
+						  4 12 0x14 0x1c  5 13 0x15 0x1d
+						  6 14 0x16 0x1e  7 15 0x17 0x1f>;
+
+			interrupts = <GIC_SPI 0xa3 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xa4 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xa5 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xa6 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xa7 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xa8 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xa9 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xaa IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xab IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xac IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xad IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xae IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0x8b IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0x8c IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0x8d IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0x8e IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xbf IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xa0 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0x80 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0x98 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xa1 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0x81 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0x99 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xaf IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xb0 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xb1 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xb2 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xb3 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xb4 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xb5 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 0xb6 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		ess-uniphy@7a00000 {
+			compatible = "qcom,ess-uniphy";
+			reg = <0x7a00000 0x20000>;
+			uniphy_access_mode = "local bus";
+		};
+
+		nss-ppe {
+			compatible = "qcom,nss-ppe";
+		};
+
+		/* CPU port towards the QCA8386 switch */
+		dp2 {
+			device_type = "network";
+			compatible = "qcom,nss-dp";
+			qcom,id = <1>;
+			reg = <0x3a500000 0x4000>;
+			qcom,mactype = <1>;
+			local-mac-address = [00 00 00 00 00 00];
+			phy-mode = "sgmii";
+			qcom,is_switch_connected = <1>;
+			qcom,mht-dev = <1>;
+		};
+	};
+};

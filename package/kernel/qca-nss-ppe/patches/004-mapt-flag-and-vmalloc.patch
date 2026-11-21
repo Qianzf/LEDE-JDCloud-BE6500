@@ -1,0 +1,98 @@
+From: Qianzf <qianzf@example.com>
+Subject: [PATCH] qca-nss-ppe: mainline has no MAP-T netdev flag
+
+IFF_EXT_MAPT and net_device::priv_flags_ext are QSDK kernel extensions.
+Define a local helper reporting false without them, and pull in vmalloc.h
+for vfree()/vzalloc().
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+diff -ru ppe3/drv/ppe_drv/ppe_drv_flow.c ppe5/drv/ppe_drv/ppe_drv_flow.c
+--- a/drv/ppe_drv/ppe_drv_flow.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_drv/ppe_drv_flow.c	2026-11-21 12:35:12.487065164 +0800
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/in.h>
++#include <linux/vmalloc.h>
+ #include <net/ipv6.h>
+ #include <linux/netdevice.h>
+ #include <linux/if_vlan.h>
+@@ -12,6 +13,23 @@
+ #include <linux/phy.h>
+ #include "ppe_drv.h"
+ #include "tun/ppe_drv_tun.h"
++/*
++ * IFF_EXT_MAPT / net_device::priv_flags_ext only exist in QSDK kernels;
++ * mainline has no MAP-T netdev tag, so report false.
++ */
++#ifndef IFF_EXT_MAPT
++static inline bool ppe_drv_dev_is_mapt(const struct net_device *dev)
++{
++	(void)dev;
++	return false;
++}
++#else
++static inline bool ppe_drv_dev_is_mapt(const struct net_device *dev)
++{
++	return dev->priv_flags_ext & IFF_EXT_MAPT;
++}
++#endif
++
+ 
+ static struct ppe_drv_flow_table_info *flow_table_info;
+ 
+@@ -3323,7 +3341,7 @@
+ 		 */
+ 		flow_cfg.fwd_type = FAL_FLOW_FORWARD;
+ 		ppe_drv_trace("%p: flow_tbl[fwd_type]: L2-Multicast: %u", pcf, FAL_FLOW_FORWARD);
+-	} else if ((match_src_ip != xlate_src_ip) || (dev_eg && (dev_eg->priv_flags_ext & IFF_EXT_MAPT))) {
++	} else if ((match_src_ip != xlate_src_ip) || (dev_eg && (ppe_drv_dev_is_mapt(dev_eg)))) {
+ 		/*
+ 		 * Case SNAT
+ 		 */
+@@ -3331,7 +3349,7 @@
+ 		flow_cfg.snat_nexthop = nh->index;
+ 		flow_cfg.snat_srcport = ppe_drv_v4_conn_flow_xlate_src_ident_get(pcf);
+ 		ppe_drv_trace("%p: flow_tbl[nat_type]: SNAT: %u snat_port: %u", pcf, FAL_FLOW_SNAT, flow_cfg.snat_srcport);
+-	} else if ((match_dest_ip != xlate_dest_ip) || (dev_in && (dev_in->priv_flags_ext & IFF_EXT_MAPT))) {
++	} else if ((match_dest_ip != xlate_dest_ip) || (dev_in && (ppe_drv_dev_is_mapt(dev_in)))) {
+ 		/*
+ 		 * Case DNAT
+ 		 */
+diff -ru ppe3/drv/ppe_drv/tun/ppe_drv_tun_v6.c ppe5/drv/ppe_drv/tun/ppe_drv_tun_v6.c
+--- a/drv/ppe_drv/tun/ppe_drv_tun_v6.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_drv/tun/ppe_drv_tun_v6.c	2026-11-21 12:35:12.492080572 +0800
+@@ -22,6 +22,23 @@
+ #include <fal/fal_port_ctrl.h>
+ #include <net/ipv6.h>
+ #include <net/vxlan.h>
++/*
++ * IFF_EXT_MAPT / net_device::priv_flags_ext only exist in QSDK kernels;
++ * mainline has no MAP-T netdev tag, so report false.
++ */
++#ifndef IFF_EXT_MAPT
++static inline bool ppe_drv_dev_is_mapt(const struct net_device *dev)
++{
++	(void)dev;
++	return false;
++}
++#else
++static inline bool ppe_drv_dev_is_mapt(const struct net_device *dev)
++{
++	return dev->priv_flags_ext & IFF_EXT_MAPT;
++}
++#endif
++
+ 
+ /*
+  * ppe_drv_tun_v6_port_stats_update()
+@@ -281,7 +298,7 @@
+ 	/*
+ 	 * Check if the rule is for MAP-T
+ 	 */
+-	if (dev->priv_flags_ext & IFF_EXT_MAPT) {
++	if (ppe_drv_dev_is_mapt(dev)) {
+ 		spin_unlock_bh(&p->lock);
+ 		return true;
+ 	}

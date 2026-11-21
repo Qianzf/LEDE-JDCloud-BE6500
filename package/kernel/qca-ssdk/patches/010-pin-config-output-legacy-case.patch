@@ -1,0 +1,26 @@
+From: Qianzf <qianzf@example.com>
+Subject: [PATCH] qca-ssdk: drop the legacy PIN_CONFIG_OUTPUT case
+
+Linux 6.18 replaced PIN_CONFIG_OUTPUT with PIN_CONFIG_OUTPUT_ENABLE, which
+the driver already handles without an output value.
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+diff -ru sdk9/src/init/ssdk_mht_pinctrl.c sdk10/src/init/ssdk_mht_pinctrl.c
+--- a/src/init/ssdk_mht_pinctrl.c	2026-07-20 11:22:55.000000000 +0800
++++ b/src/init/ssdk_mht_pinctrl.c	2026-11-21 12:01:03.680811948 +0800
+@@ -287,11 +287,9 @@
+                 rv = mht_gpio_pin_cfg_set_drvs(dev_id, pin, arg);
+                 break;
+ 
+-            case PIN_CONFIG_OUTPUT:
+-                rv = mht_gpio_pin_cfg_set_oe(dev_id, pin, A_TRUE);
+-                rv = mht_gpio_set_bit(dev_id, pin, arg);
+-                break;
+-
++            /* PIN_CONFIG_OUTPUT is gone in 6.18; PIN_CONFIG_OUTPUT_ENABLE
++             * below only drives the output enable, matching the new API.
++             */
+             case PIN_CONFIG_INPUT_ENABLE:
+                 rv = mht_gpio_pin_cfg_set_oe(dev_id, pin, A_FALSE);
+                 break;

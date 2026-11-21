@@ -1,0 +1,233 @@
+From: Qianzf <qianzf@example.com>
+Subject: [PATCH] qca-nss-ppe: 6.18 adaptations (timers, skb flags, cmdline)
+
+- del_timer_sync() is timer_delete_sync()
+- QSDK hrtimer helpers replaced by hrtimer_setup()/hrtimer_start_range_ns()
+- skb fast_xmit/fast_recycled/recycled_for_ds and fast xmit helpers do not
+  exist on mainline
+- linux/debug_mem_usage.h only exists in QSDK kernels
+- saved_command_line is not exported anymore, use the default profile
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+diff -ru ppt3/drv/ppe_ds/ppe_ds.c ppe10/drv/ppe_ds/ppe_ds.c
+--- a/drv/ppe_ds/ppe_ds.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_ds/ppe_ds.c	2026-11-21 13:44:56.804923242 +0800
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/types.h>
++#include <linux/timer.h>
+ #include <linux/kernel.h>
+ #include <linux/debugfs.h>
+ 
+@@ -891,8 +892,9 @@
+ 		/*
+ 		 * Init high res timer.
+ 		 */
+-		hrtimer_init_and_bind(&node->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL, cpu);
+-		node->timer.function = ppe_ds_timer;
++		/* mainline: hrtimer_setup() takes the callback directly */
++		hrtimer_setup(&node->timer, ppe_ds_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++		(void)cpu;
+ 		ppe_ds_info("For PPE-DS node iteration count: %d, cpu mask is 0x%x\n",
+ 				ppeds_node_iter_cnt, cpu);
+ 	}
+@@ -1392,7 +1394,7 @@
+ 
+ 	if (polling_for_idx_update) {
+ 		node->timer_enabled = true;
+-		hrtimer_start_range_ns_on_cpu(&node->timer,
++		hrtimer_start_range_ns(&node->timer,
+ 				ns_to_ktime(IDX_MGMT_PERIOD),
+ 				0, HRTIMER_MODE_REL_PINNED);
+ 	}
+diff -ru ppt3/drv/ppe_ds/ppe_ds_main.c ppe10/drv/ppe_ds/ppe_ds_main.c
+--- a/drv/ppe_ds/ppe_ds_main.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_ds/ppe_ds_main.c	2026-11-21 13:58:19.642891459 +0800
+@@ -15,12 +15,15 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include <linux/version.h>
+ #include <linux/module.h>
+ 
+ #include "ppe_ds_stats.h"
+ #include "ppe_ds.h"
+ 
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0))
+ extern char *saved_command_line;
++#endif
+ 
+ /*
+  * PPE-DS ring processing mode selection parameter.
+@@ -109,8 +112,13 @@
+ #elif defined(PPE_DS_MEM_PROFILE_LOW)
+ 	ppe_ds_active_mem_profile = PPE_DS_MEM_PROFILE_DYNAMIC_LOW;
+ #else
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0))
++	/* saved_command_line is no longer exported to modules */
++	const char *param = NULL;
++#else
+ 	const char *cmdline = saved_command_line;
+ 	const char *param = strstr(cmdline, "mem-profile=");
++#endif
+ 	if (!param) {
+ 		ppe_ds_active_mem_profile = PPE_DS_MEM_PROFILE_DYNAMIC_DEFAULT;
+ 		ppe_ds_info("mem-profile not found in bootargs, using DEFAULT\n");
+diff -ru ppt3/drv/ppe_qdisc/ppe_qdisc_stats.c ppe10/drv/ppe_qdisc/ppe_qdisc_stats.c
+--- a/drv/ppe_qdisc/ppe_qdisc_stats.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_qdisc/ppe_qdisc_stats.c	2026-11-21 13:44:56.813866553 +0800
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include "ppe_qdisc.h"
++#include <linux/timer.h>
+ 
+ static LIST_HEAD(ppe_qdisc_stats_list);			/* List of stats request nodes */
+ static DEFINE_SPINLOCK(ppe_qdisc_stats_list_lock);	/* Lock for the stats list */
+@@ -310,18 +311,18 @@
+ 
+ cleanup:
+ 	/*
+-	 * Use del_timer_sync() instead of del_timer() to ensure that any
++	 * Use timer_delete_sync() instead of del_timer() to ensure that any
+ 	 * currently-executing timer callback (ppe_qdisc_stats_sync_restart)
+ 	 * has fully completed before we free pqsw. del_timer() only cancels
+ 	 * a pending (not-yet-fired) timer and returns immediately if the
+ 	 * callback is already running on another CPU, which would allow
+ 	 * the callback to dereference the freed pqsw (use-after-free).
+ 	 *
+-	 * del_timer_sync() is safe here because ppe_qdisc_stats_sync_restart
++	 * timer_delete_sync() is safe here because ppe_qdisc_stats_sync_restart
+ 	 * never calls ppe_qdisc_stats_sync_many_exit(), so there is no
+ 	 * deadlock risk.
+ 	 */
+-	del_timer_sync(&pqsw->stats_get_timer);
++	timer_delete_sync(&pqsw->stats_get_timer);
+ 
+ 	/*
+ 	 * Free the qdisc stats list for this root node
+diff -ru ppt3/drv/ppe_vp/ppe_vp.c ppe10/drv/ppe_vp/ppe_vp.c
+--- a/drv/ppe_vp/ppe_vp.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_vp/ppe_vp.c	2026-11-21 13:44:56.809866422 +0800
+@@ -22,7 +22,7 @@
+ 	struct ppe_vp *vp = vp_priv->vp;
+ 
+ 	if (unlikely(!ppe_vp_tx_to_ppe(vp->port_num, skb))) {
+-		skb->fast_xmit = 0;
++		;
+ 		dev_kfree_skb_any(skb);
+ 	}
+ 
+diff -ru ppt3/drv/ppe_vp/ppe_vp_base.c ppe10/drv/ppe_vp/ppe_vp_base.c
+--- a/drv/ppe_vp/ppe_vp_base.c	2026-11-21 13:42:37.195522118 +0800
++++ b/drv/ppe_vp/ppe_vp_base.c	2026-11-21 13:44:56.805866291 +0800
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "ppe_vp_base.h"
++#include <linux/timer.h>
+ #include "ppe_vp_rx.h"
+ 
+ struct ppe_vp_base vp_base;
+@@ -333,7 +334,7 @@
+ 	struct ppe_vp_base *pvb = &vp_base;
+ 
+ 	nss_dp_vp_rx_unregister_cb();
+-	del_timer_sync(&pvb->hw_port_stats_timer);
++	timer_delete_sync(&pvb->hw_port_stats_timer);
+ 
+ 	if (pvb->vp_hdr) {
+ 		unregister_sysctl_table(pvb->vp_hdr);
+diff -ru ppt3/drv/ppe_vp/ppe_vp_rx.c ppe10/drv/ppe_vp/ppe_vp_rx.c
+--- a/drv/ppe_vp/ppe_vp_rx.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_vp/ppe_vp_rx.c	2026-11-21 13:47:15.224248864 +0800
+@@ -4,12 +4,19 @@
+  */
+ 
+ #include <linux/version.h>
++/* QSDK-only skb fast xmit helpers; mainline uses the plain paths */
++#define dev_fast_xmit_vp(skb, dev)		(false)
++#define dev_fast_xmit_qdisc(skb, dev, bottom)	(false)
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+ #include <net/page_pool/helpers.h>
+ #include <ppe_drv.h>
+ #include "ppe_vp_base.h"
++#if defined(CONFIG_QCA_DEBUG_MEM_USAGE)
+ #include <linux/debug_mem_usage.h>
++#else
++static inline void mem_debug_update_skb(struct sk_buff *skb) { (void)skb; }
++#endif
+ 
+ #define PPE_VP_FLOW_IDX_FOR_NO_QDISC	-1
+ extern struct ppe_vp_base vp_base;
+@@ -24,13 +31,13 @@
+ 	struct net_device *dev = skb->dev;
+ 
+ 	skb->protocol = eth_type_trans(skb, dev);
+-	skb->fast_xmit = 0;
++	;
+ 
+ 	/*
+ 	 * Reset the below flags in case any of DS flow is exceptioned.
+ 	 */
+-	skb->fast_recycled = 0;
+-	skb->recycled_for_ds = 0;
++	;
++	/* recycled_for_ds: QSDK-only skb flag */
+ 	mem_debug_update_skb(skb);
+ 	netif_receive_skb(skb);
+ 	return true;
+diff -ru ppt3/drv/ppe_vp/ppe_vp_tx.c ppe10/drv/ppe_vp/ppe_vp_tx.c
+--- a/drv/ppe_vp/ppe_vp_tx.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_vp/ppe_vp_tx.c	2026-11-21 13:49:38.322934762 +0800
+@@ -11,7 +11,11 @@
+ #include <ppe_drv_sc.h>
+ #include "ppe_vp_base.h"
+ #include "ppe_vp_tx.h"
++#if defined(CONFIG_QCA_DEBUG_MEM_USAGE)
+ #include <linux/debug_mem_usage.h>
++#else
++static inline void mem_debug_update_skb(struct sk_buff *skb) { (void)skb; }
++#endif
+ 
+ extern struct ppe_vp_base vp_base;
+ 
+@@ -69,7 +73,7 @@
+ 	 * This would enable making list of skb's while freeing in edma tx complete
+ 	 */
+ 	if (likely(!skb_is_nonlinear(skb))) {
+-		skb->fast_xmit = 1;
++		/* fast_xmit: QSDK-only skb flag */ ;
+ 	}
+ 
+ 	len = skb->len;
+@@ -85,7 +89,7 @@
+ 		u64_stats_update_begin(&tx_stats->syncp);
+ 		tx_stats->tx_drops++;
+ 		u64_stats_update_end(&tx_stats->syncp);
+-		skb->fast_xmit = 0;
++		/* fast_xmit: QSDK-only skb flag */ ;
+ 		mem_debug_update_skb(skb);
+ 		dev_kfree_skb_any(skb);
+ 		rcu_read_unlock();
+@@ -139,7 +143,7 @@
+ 		rcu_read_unlock();
+ 
+ 		ppe_vp_info("%px: Dest VP %d inactive, dropping skb %px", dvp, vp_num, skb);
+-		skb->fast_xmit = 0;
++		/* fast_xmit: QSDK-only skb flag */ ;
+ 		mem_debug_update_skb(skb);
+ 		dev_kfree_skb_any(skb);
+ 		return false;
+@@ -168,7 +172,7 @@
+ 		u64_stats_update_begin(&rx_stats->syncp);
+ 		rx_stats->rx_drops++;
+ 		u64_stats_update_end(&rx_stats->syncp);
+-		skb->fast_xmit = 0;
++		/* fast_xmit: QSDK-only skb flag */ ;
+ 		mem_debug_update_skb(skb);
+ 		dev_kfree_skb_any(skb);
+ 		rcu_read_unlock();

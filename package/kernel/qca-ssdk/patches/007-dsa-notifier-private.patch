@@ -1,0 +1,60 @@
+From: Qianzf <qianzf@example.com>
+Subject: [PATCH] qca-ssdk: the DSA link notifier is private in 6.18
+
+Linux 6.18 moved DSA_NOTIFIER_PORT_LINK, struct dsa_notifier_link and
+the register/unregister helpers into net/dsa/ internals.  Compile that
+path out by default; switch link state keeps being tracked through the
+MAC polling work.
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+--- a/src/init/ssdk_init.c	2026-11-21 10:59:07.246288705 +0800
++++ b/src/init/ssdk_init.c	2026-11-21 11:14:08.013755090 +0800
+@@ -1724,7 +1724,7 @@
+ 	return ssdk_phy_priv_data_get(dev_id);
+ }
+ 
+-static int ssdk_dsa_event_link_change(struct net_device *dev, bool link)
++static int __attribute__((unused)) ssdk_dsa_event_link_change(struct net_device *dev, bool link)
+ {
+ 	struct qca_phy_priv* priv = ssdk_get_priv_with_dsa_dev(dev);
+ 	if (!priv) {
+@@ -1753,6 +1753,12 @@
+ 	}
+ }
+ 
++/*
++ * Linux 6.18 moved the DSA notifier API into net/dsa/ internals, so the
++ * driver cannot register for port link events anymore.  Link state keeps
++ * being tracked through the MAC polling path.
++ */
++#if defined(SSDK_USE_DSA_LINK_NOTIFIER)
+ static int ssdk_dsa_event_nb(struct notifier_block *unused,
+ 		unsigned long event, void *ptr)
+ {
+@@ -1773,6 +1779,7 @@
+ static struct notifier_block ssdk_dsa_notifier_nb = {
+ 	.notifier_call = ssdk_dsa_event_nb,
+ };
++#endif /* SSDK_USE_DSA_LINK_NOTIFIER */
+ #endif
+ 
+ static int ssdk_switch_register(a_uint32_t dev_id, ssdk_chip_type  chip_type)
+@@ -1855,7 +1862,7 @@
+ 		}
+ 	}
+ 
+-#if IS_ENABLED(CONFIG_NET_DSA)
++#if IS_ENABLED(CONFIG_NET_DSA) && defined(SSDK_USE_DSA_LINK_NOTIFIER)
+ 	if (priv->version == QCA_VER_MHT ||
+ 		priv->version == QCA_VER_AR8337 ||
+ 		priv->version == QCA_VER_AR8327)
+@@ -1883,7 +1890,7 @@
+ 	unregister_switch(&qca_phy_priv_global[dev_id]->sw_dev);
+ #endif
+ 
+-#if IS_ENABLED(CONFIG_NET_DSA)
++#if IS_ENABLED(CONFIG_NET_DSA) && defined(SSDK_USE_DSA_LINK_NOTIFIER)
+ 	if (priv->version == QCA_VER_MHT ||
+ 		priv->version == QCA_VER_AR8337 ||
+ 		priv->version == QCA_VER_AR8327)

@@ -1,0 +1,28 @@
+From: Qianzf <qianzf@example.com>
+Subject: [PATCH] qca-ssdk: provide the multi-gig link speeds
+
+QSDK kernels extend enum switch_port_speed with 2.5G/5G/10G, mainline
+does not.  Define the missing values locally.
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+--- a/src/ref/ref_port_ctrl.c	2026-07-20 11:22:55.000000000 +0800
++++ b/src/ref/ref_port_ctrl.c	2026-11-21 10:41:56.525230145 +0800
+@@ -37,6 +37,17 @@
+ #include <linux/time.h>
+ #include "ref_port_ctrl.h"
+ 
++/* QSDK kernels extend enum switch_port_speed with the multi-gig rates */
++#ifndef SWITCH_PORT_SPEED_2500
++#define SWITCH_PORT_SPEED_2500 2500
++#endif
++#ifndef SWITCH_PORT_SPEED_5000
++#define SWITCH_PORT_SPEED_5000 5000
++#endif
++#ifndef SWITCH_PORT_SPEED_10000
++#define SWITCH_PORT_SPEED_10000 10000
++#endif
++
+ #if defined(IN_SWCONFIG)
+ int qca_ar8327_sw_get_port_link(struct switch_dev *dev, int port,
+ 	struct switch_port_link *link)

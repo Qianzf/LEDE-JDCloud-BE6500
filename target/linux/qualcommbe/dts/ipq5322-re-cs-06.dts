@@ -5,6 +5,7 @@
 #include "ipq5332-common.dtsi"
 #include "ipq5332-common-qca8386.dtsi"
 #include "ipq5332-common-wifi.dtsi"
+#include "ipq5332-qca-nss.dtsi"
 
 / {
 	model = "JDCloud RE-CS-06/BE6500";

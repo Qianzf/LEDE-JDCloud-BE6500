@@ -1,0 +1,284 @@
+From: Qianzf <qianzf@example.com>
+Subject: [PATCH] qca-nss-ppe: 6.18 sysctl and DSA API changes
+
+- proc/sysctl handlers take a const struct ctl_table pointer since 6.18
+- dsa_slave_dev_check() was renamed dsa_user_dev_check()
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+diff -ru ppe2/drv/ppe_drv/ppe_drv.c ppe3/drv/ppe_drv/ppe_drv.c
+--- a/drv/ppe_drv/ppe_drv.c	2026-11-21 12:29:44.054110038 +0800
++++ b/drv/ppe_drv/ppe_drv.c	2026-11-21 12:31:34.773631412 +0800
+@@ -313,7 +313,7 @@
+  * ppe_drv_sixth_tuple_mode_handler()
+  *	change the sixth mode.
+  */
+-static int ppe_drv_sixth_tuple_mode_handler(struct ctl_table *table, int write,
++static int ppe_drv_sixth_tuple_mode_handler(const struct ctl_table *table, int write,
+ 		void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	int ret, cur_sixth_tuple_mode;
+@@ -2998,7 +2998,7 @@
+  * ppe_drv_if_bm_to_offload_handler()
+  *	API to configure the interface bitmask where the offload is enabled
+  */
+-static int ppe_drv_if_bm_to_offload_handler(struct ctl_table *table, int write,
++static int ppe_drv_if_bm_to_offload_handler(const struct ctl_table *table, int write,
+ 		void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	int ret;
+@@ -3032,7 +3032,7 @@
+  * ppe_drv_disable_port_mtu_check_handler()
+  * 	Set disable port mtu config
+  */
+-static int ppe_drv_disable_port_mtu_check_handler(struct ctl_table *table,
++static int ppe_drv_disable_port_mtu_check_handler(const struct ctl_table *table,
+ 						int write, void __user *buffer,
+ 						size_t *lenp, loff_t *ppos)
+ {
+@@ -3055,7 +3055,7 @@
+  * ppe_drv_l4_checksum_exception_enable()
+  *	API to enable/disable the exception for l4 checksum.
+  */
+-int ppe_drv_l4_checksum_exception_enable(struct ctl_table *table, int write,
++int ppe_drv_l4_checksum_exception_enable(const struct ctl_table *table, int write,
+ 		void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	int ret;
+@@ -3092,7 +3092,7 @@
+  * ppe_drv_mac_lrn_exception_en()
+  *	API to enable/disable the exception for MAC address learn exception.
+  */
+-int ppe_drv_mac_lrn_exception_en(struct ctl_table *table, int write,
++int ppe_drv_mac_lrn_exception_en(const struct ctl_table *table, int write,
+ 		void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	int ret;
+@@ -3112,7 +3112,7 @@
+  * ppe_drv_loopback_port_feature_write_handler()
+  *	sysctl handler for loopback port write operation.
+  */
+-static int ppe_drv_loopback_port_feature_write_handler(struct ctl_table *table, int write,
++static int ppe_drv_loopback_port_feature_write_handler(const struct ctl_table *table, int write,
+ 		void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	struct ppe_drv *p = ppe_drv_gbl;
+@@ -3167,7 +3167,7 @@
+  * ppe_drv_wlan_host_assist_qdisc_en_handler()
+  *	Handler for wlan_host_assist_qdisc_en sysctl
+  */
+-static int ppe_drv_wlan_host_assist_qdisc_en_handler(struct ctl_table *table, int write,
++static int ppe_drv_wlan_host_assist_qdisc_en_handler(const struct ctl_table *table, int write,
+ 		void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	int ret;
+@@ -3216,7 +3216,7 @@
+  *		- Clears BIT(1) and BIT(2) to disable IPsec AH and ESP flow keys
+  *		- Writes the updated configuration back to hardware
+  */
+-static int ppe_drv_ipsec_pass_through_en_handler(struct ctl_table *table, int write,
++static int ppe_drv_ipsec_pass_through_en_handler(const struct ctl_table *table, int write,
+ 		void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	int ret;
+@@ -3287,7 +3287,7 @@
+  * ppe_drv_eth2eth_offload_if_bitmap_handler()
+  * 	Set eth to eth offload with if bitmap config
+  */
+-static int ppe_drv_eth2eth_offload_if_bitmap_handler(struct ctl_table *table,
++static int ppe_drv_eth2eth_offload_if_bitmap_handler(const struct ctl_table *table,
+ 						int write, void __user *buffer,
+ 						size_t *lenp, loff_t *ppos)
+ {
+@@ -3310,7 +3310,7 @@
+  * ppe_drv_static_dbg_level_handler()
+  *	Set static debug level for ppe-driver.
+  */
+-static int ppe_drv_static_dbg_level_handler(struct ctl_table *table,
++static int ppe_drv_static_dbg_level_handler(const struct ctl_table *table,
+ 					int write, void __user *buffer,
+ 					size_t *lenp, loff_t *ppos)
+ {
+@@ -3356,7 +3356,7 @@
+  * ppe_drv_pkt_padding_handler
+  * 	sysctl to enable/disable stripping of packet padding
+  */
+-static int ppe_drv_pkt_padding_handler(struct ctl_table *table,  int write, void __user *buffer, size_t *lenp, loff_t *ppos)
++static int ppe_drv_pkt_padding_handler(const struct ctl_table *table,  int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	fal_pktedit_padding_t padding = { 0 };
+ 	char *start_ch_ptr = NULL;
+@@ -3449,7 +3449,7 @@
+  * ppe_drv_upstream_dev_handler()
+  *      Set upstream device.
+  */
+-static int ppe_drv_upstream_dev_handler(struct ctl_table *table,
++static int ppe_drv_upstream_dev_handler(const struct ctl_table *table,
+ 		int write, void __user *buffer,
+ 		size_t *lenp, loff_t *ppos)
+ {
+@@ -3740,7 +3740,7 @@
+  * ppe_drv_src2uni_handler()
+  *      Set Source Profile to UNI port mapping.
+  */
+-static int ppe_drv_src2uni_handler(struct ctl_table *table,
++static int ppe_drv_src2uni_handler(const struct ctl_table *table,
+ 		int write, void __user *buffer,
+ 		size_t *lenp, loff_t *ppos)
+ {
+@@ -3891,7 +3891,7 @@
+ 						continue;
+ 
+ 					if (!((pp_local->type == PPE_DRV_PORT_PHYSICAL) ||
+-					      ((pp_local->type == PPE_DRV_PORT_VIRTUAL) && dsa_slave_dev_check(pp_local->dev))))
++					      ((pp_local->type == PPE_DRV_PORT_VIRTUAL) && dsa_user_dev_check(pp_local->dev))))
+ 						continue;
+ 
+ 					q_dst.src_profile = src_profile;
+@@ -3964,7 +3964,7 @@
+ 			continue;
+ 
+ 		if (!((pp_local->type == PPE_DRV_PORT_PHYSICAL) ||
+-		      ((pp_local->type == PPE_DRV_PORT_VIRTUAL) && dsa_slave_dev_check(pp_local->dev))))
++		      ((pp_local->type == PPE_DRV_PORT_VIRTUAL) && dsa_user_dev_check(pp_local->dev))))
+ 			continue;
+ 
+ 		q_dst.src_profile = src_profile;
+@@ -4268,7 +4268,7 @@
+  * 	echo 'flush' : Remove all the entries from the map.
+  * 	echo 'flush <ingress_dev> <egress_dev>' : Removes one specific pair
+  */
+-static int ppe_drv_lpbk_buffer_map_handler(struct ctl_table *table,
++static int ppe_drv_lpbk_buffer_map_handler(const struct ctl_table *table,
+ 		int write, void __user *buffer,
+ 		size_t *lenp, loff_t *ppos)
+ {
+@@ -4442,7 +4442,7 @@
+  * 	echo 1 > /proc/sys/ppe/ppe_drv/ddr_buffer_auto_en (enable)
+  * 	echo 0 > /proc/sys/ppe/ppe_drv/ddr_buffer_auto_en (disable)
+  */
+-static int ppe_drv_ddr_buffer_auto_en_handler(struct ctl_table *table,
++static int ppe_drv_ddr_buffer_auto_en_handler(const struct ctl_table *table,
+ 		int write, void __user *buffer,
+ 		size_t *lenp, loff_t *ppos)
+ {
+diff -ru ppe2/drv/ppe_drv/ppe_drv_nexthop.c ppe3/drv/ppe_drv/ppe_drv_nexthop.c
+--- a/drv/ppe_drv/ppe_drv_nexthop.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_drv/ppe_drv_nexthop.c	2026-11-21 12:31:34.723463382 +0800
+@@ -526,7 +526,7 @@
+ 		is_vlan_as_vp = is_vlan_dev(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+ 		is_vlan_as_veip = is_vlan_dev(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VEIP);
+ #if defined(NSS_VLAN_BASED_DSA_SUPPORT) || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)
+-		is_dsa_dev = dsa_slave_dev_check(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
++		is_dsa_dev = dsa_user_dev_check(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+ #endif
+ 	}
+ 
+@@ -1022,7 +1022,7 @@
+ 		is_vlan_as_vp = is_vlan_dev(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+ 		is_vlan_as_veip = is_vlan_dev(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VEIP);
+ #if defined(NSS_VLAN_BASED_DSA_SUPPORT) || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)
+-		is_dsa_dev = dsa_slave_dev_check(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
++		is_dsa_dev = dsa_user_dev_check(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+ #endif
+ 	}
+ 
+diff -ru ppe2/drv/ppe_drv/ppe_drv_port.c ppe3/drv/ppe_drv/ppe_drv_port.c
+--- a/drv/ppe_drv/ppe_drv_port.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_drv/ppe_drv_port.c	2026-11-21 12:31:34.726594193 +0800
+@@ -1647,7 +1647,7 @@
+ 	}
+ 
+ #if defined(NSS_VLAN_BASED_DSA_SUPPORT) || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)
+-	if ((pp->type == PPE_DRV_PORT_VIRTUAL) && dsa_slave_dev_check(pp->dev)) {
++	if ((pp->type == PPE_DRV_PORT_VIRTUAL) && dsa_user_dev_check(pp->dev)) {
+ 		profile = PPE_DRV_REDIR_PROFILE_ID;
+ 	}
+ #endif
+diff -ru ppe2/drv/ppe_drv/ppe_drv_v4.c ppe3/drv/ppe_drv/ppe_drv_v4.c
+--- a/drv/ppe_drv/ppe_drv_v4.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_drv/ppe_drv_v4.c	2026-11-21 12:31:34.729630013 +0800
+@@ -2043,7 +2043,7 @@
+ 
+ 	is_vlan_as_veip = is_vlan_dev(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VEIP);
+ #if defined(NSS_VLAN_BASED_DSA_SUPPORT) || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)
+-	is_dsa_dev = dsa_slave_dev_check(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
++	is_dsa_dev = dsa_user_dev_check(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+ #endif
+ 
+ 	if (vlan_cnt && !is_vlan_as_veip && !is_vlan_as_vp && !eg_vsi_if && !is_dsa_dev) {
+diff -ru ppe2/drv/ppe_drv/ppe_drv_v6.c ppe3/drv/ppe_drv/ppe_drv_v6.c
+--- a/drv/ppe_drv/ppe_drv_v6.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_drv/ppe_drv_v6.c	2026-11-21 12:31:34.733630140 +0800
+@@ -2573,7 +2573,7 @@
+ 
+ 	is_vlan_as_veip = is_vlan_dev(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VEIP);
+ #if defined(NSS_VLAN_BASED_DSA_SUPPORT) || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)
+-	is_dsa_dev = dsa_slave_dev_check(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
++	is_dsa_dev = dsa_user_dev_check(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+ #endif
+ 
+ 	if (vlan_cnt && !is_vlan_as_veip && !is_vlan_as_vp && !eg_vsi_if && !is_dsa_dev) {
+diff -ru ppe2/drv/ppe_drv/ppe_drv_vlan.c ppe3/drv/ppe_drv/ppe_drv_vlan.c
+--- a/drv/ppe_drv/ppe_drv_vlan.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_drv/ppe_drv_vlan.c	2026-11-21 12:31:34.737630267 +0800
+@@ -295,7 +295,7 @@
+ 	/*
+ 	 * Handling for DSA/VLAN on DSA interface
+ 	 */
+-	if (!base_dev && dsa_slave_dev_check(iface->dev)) {
++	if (!base_dev && dsa_user_dev_check(iface->dev)) {
+ 		/*
+ 		 * We reach here if it's not a VLAN dev, eg: lan1.
+ 		 * base_dev is NULL at this point. Set base_dev as lan1's CPU port.
+@@ -304,7 +304,7 @@
+ 		if (dp) {
+ 			base_dev = dsa_port_to_master(dp);
+ 		}
+-	} else if (base_dev && dsa_slave_dev_check(base_dev)) {
++	} else if (base_dev && dsa_user_dev_check(base_dev)) {
+ 		/*
+ 		 * VLAN over DSA interface ? eg: lan1.10.
+ 		 * base_dev would already been set to lan1. Set base_dev as lan1's CPU port.
+@@ -421,7 +421,7 @@
+ 	/*
+ 	 * Handling for DSA/VLAN on DSA interface
+ 	 */
+-	if (!base_dev && dsa_slave_dev_check(iface->dev)) {
++	if (!base_dev && dsa_user_dev_check(iface->dev)) {
+ 		/*
+ 		 * We reach here if it's not a VLAN dev, eg: lan1.
+ 		 * base_dev is NULL at this point. Set base_dev as lan1's CPU port.
+@@ -430,7 +430,7 @@
+ 		if (dp) {
+ 			base_dev = dsa_port_to_master(dp);
+ 		}
+-	} else if (base_dev && dsa_slave_dev_check(base_dev)) {
++	} else if (base_dev && dsa_user_dev_check(base_dev)) {
+ 		/*
+ 		 * VLAN over DSA interface ? eg: lan1.10.
+ 		 * base_dev would already been set to lan1. Set base_dev as lan1's CPU port.
+diff -ru ppe2/drv/ppe_vp/ppe_vp_base.c ppe3/drv/ppe_vp/ppe_vp_base.c
+--- a/drv/ppe_vp/ppe_vp_base.c	2026-08-10 23:31:55.000000000 +0800
++++ b/drv/ppe_vp/ppe_vp_base.c	2026-11-21 12:31:34.777154605 +0800
+@@ -33,7 +33,7 @@
+  *
+  * Only disabled allocation of new VPs. Old VPs are not destroyed.
+  */
+-static int ppe_vp_enable_handler(struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
++static int ppe_vp_enable_handler(const struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+ 	int ret;
+ 	struct ppe_vp_base *pvb = &vp_base;
+diff -ru ppe2/test/ppe_mirror_test.c ppe3/test/ppe_mirror_test.c
+--- a/test/ppe_mirror_test.c	2026-08-10 23:31:55.000000000 +0800
++++ b/test/ppe_mirror_test.c	2026-11-21 12:31:34.782804869 +0800
+@@ -777,7 +777,7 @@
+  * ppe_mirror_test_config_params()
+  *	Get the buffer and process the command.
+  */
+-static int ppe_mirror_test_config_params(struct ctl_table *ctl, int write, void __user *buf, size_t *lenp, loff_t *ppos)
++static int ppe_mirror_test_config_params(const struct ctl_table *ctl, int write, void __user *buf, size_t *lenp, loff_t *ppos)
+ {
+ 	char *buffer, *pfree;
+ 	char * nextarg;

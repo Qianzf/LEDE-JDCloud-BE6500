@@ -1,0 +1,17 @@
+From: Qianzf <qianzf@example.com>
+Subject: [PATCH] qca-ssdk: include platform_device.h in ssdk_dts.c
+
+Newer kernels no longer pull the declaration in implicitly.
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+--- a/src/init/ssdk_dts.c	2026-07-20 11:22:55.000000000 +0800
++++ b/src/init/ssdk_dts.c	2026-11-21 11:29:39.329491328 +0800
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/kconfig.h>
++#include <linux/platform_device.h>
+ #include <linux/types.h>
+ #if defined(CONFIG_OF)
+ #include <linux/of.h>

@@ -1,0 +1,101 @@
+From: Qianzf <qianzf@example.com>
+Date: Sat, 21 Nov 2026 07:45:00 +0800
+Subject: [PATCH] net: phy: expose the PHY package helpers again
+
+The phy_package_* helpers are exported for modules, but their struct and
+prototypes were moved into the private drivers/net/phy/phylib.h and the
+implementation file, so out-of-tree PHY drivers (qca-nss-phy: qca8084,
+qce1204, qca81xx) can no longer use them.
+
+Move struct phy_package_shared and the helper prototypes back into the
+public include/linux/phy.h.  No functional change.
+
+Signed-off-by: Qianzf <qianzf@example.com>
+---
+--- a/include/linux/phy.h	2026-11-21 07:41:49.346226445 +0800
++++ b/include/linux/phy.h	2026-11-21 07:41:49.359734012 +0800
+@@ -20,6 +20,8 @@
+ #include <linux/mdio.h>
+ #include <linux/mii.h>
+ #include <linux/mii_timestamper.h>
++
++struct phy_package_shared;
+ #include <linux/module.h>
+ #include <linux/timer.h>
+ #include <linux/workqueue.h>
+@@ -634,6 +636,48 @@
+  * Contains some infrastructure for polling and interrupt
+  * handling, as well as handling shifts in PHY hardware state
+  */
++struct phy_package_shared;
++
++/*
++ * struct phy_package_shared - Shared information in PHY packages
++ *
++ * Exposed for out-of-tree PHY drivers that need to program a PHY package
++ * (see phy_package_join() and phy_package_leave()).
++ */
++struct phy_package_shared {
++	u8 base_addr;
++	/* With PHY package defined in DT this points to the PHY package node */
++	struct device_node *np;
++	refcount_t refcnt;
++	unsigned long flags;
++	size_t priv_size;
++	/* private data pointer, shared between phydev's of the package */
++	void *priv;
++};
++
++/* PHY package helpers (implemented by drivers/net/phy/phy_package.c) */
++struct device_node *phy_package_get_node(struct phy_device *phydev);
++void *phy_package_get_priv(struct phy_device *phydev);
++int __phy_package_read(struct phy_device *phydev, unsigned int addr_offset,
++		       u32 regnum);
++int __phy_package_write(struct phy_device *phydev, unsigned int addr_offset,
++			u32 regnum, u16 val);
++int __phy_package_read_mmd(struct phy_device *phydev,
++			   unsigned int addr_offset, int devad, u32 regnum);
++int __phy_package_write_mmd(struct phy_device *phydev,
++			    unsigned int addr_offset, int devad,
++			    u32 regnum, u16 val);
++bool phy_package_init_once(struct phy_device *phydev);
++bool phy_package_probe_once(struct phy_device *phydev);
++bool phy_package_remove_once(struct phy_device *phydev);
++int phy_package_join(struct phy_device *phydev, int base_addr, size_t priv_size);
++int of_phy_package_join(struct phy_device *phydev, size_t priv_size);
++void phy_package_leave(struct phy_device *phydev);
++int devm_phy_package_join(struct device *dev, struct phy_device *phydev,
++			  int base_addr, size_t priv_size);
++int devm_of_phy_package_join(struct device *dev, struct phy_device *phydev,
++			     size_t priv_size);
++
+ struct phy_device {
+ 	struct mdio_device mdio;
+ 
+--- a/drivers/net/phy/phy_package.c	2026-11-21 07:41:49.350226572 +0800
++++ b/drivers/net/phy/phy_package.c	2026-11-21 07:41:49.363236370 +0800
+@@ -23,23 +23,7 @@
+  * package, for example a quad PHY. See phy_package_join() and
+  * phy_package_leave().
+  */
+-struct phy_package_shared {
+-	u8 base_addr;
+-	/* With PHY package defined in DT this points to the PHY package node */
+-	struct device_node *np;
+-	refcount_t refcnt;
+-	unsigned long flags;
+-	size_t priv_size;
+-
+-	/* private data pointer */
+-	/* note that this pointer is shared between different phydevs and
+-	 * the user has to take care of appropriate locking. It is allocated
+-	 * and freed automatically by phy_package_join() and
+-	 * phy_package_leave().
+-	 */
+-	void *priv;
+-};
+-
++/* struct phy_package_shared is declared in include/linux/phy.h */
+ struct device_node *phy_package_get_node(struct phy_device *phydev)
+ {
+ 	return phydev->shared->np;
