@@ -94,7 +94,7 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
  };
  
  struct ath12k_ds_buffer {
-@@ -862,3 +863,448 @@ bad_cookie:
+@@ -862,3 +863,450 @@ bad_cookie:
  	return (done + 3) >> 2;
  }
  
@@ -179,9 +179,9 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
 +		 FIELD_PREP(GENMASK(9, 8), 3) |
 +		 FIELD_PREP(GENMASK(15, 10), bank) |
 +		 FIELD_PREP(GENMASK(23, 16), arvif->vdev_id);
-+	ath12k_hif_write32(ds->dp->ab, ATH12K_DS_VP_TABLE + i * 4, config);
++	ath12k_hif_write32(ds->dp->ab, ATH12K_DS_VP_TABLE + (u32)port * 4, config);
 +	/* Finish the WLAN table write before PPE can publish a descriptor. */
-+	ath12k_hif_read32(ds->dp->ab, ATH12K_DS_VP_TABLE + i * 4);
++	ath12k_hif_read32(ds->dp->ab, ATH12K_DS_VP_TABLE + (u32)port * 4);
 +	/* Publish direct delivery only after all tracked peer submissions. */
 +	vp = &ds->vps[i];
 +	vp->reserved = true;
@@ -526,8 +526,10 @@ Signed-off-by: ViKing <viking.yfy@qq.com>
 +				}
 +				if (!deleted || !vp->drained || ds->faulted)
 +					continue;
-+				ath12k_hif_write32(dp->ab, ATH12K_DS_VP_TABLE + i * 4, 0);
-+				ath12k_hif_read32(dp->ab, ATH12K_DS_VP_TABLE + i * 4);
++				ath12k_hif_write32(dp->ab, ATH12K_DS_VP_TABLE +
++						  (u32)vp->port * 4, 0);
++				ath12k_hif_read32(dp->ab, ATH12K_DS_VP_TABLE +
++						 (u32)vp->port * 4);
 +				ret = qcom_ppe_ds_vp_free(ds->handle, vp->port);
 +				if (ret) {
 +					fault = true;

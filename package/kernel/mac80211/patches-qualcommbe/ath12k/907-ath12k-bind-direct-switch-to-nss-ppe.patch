@@ -49,7 +49,7 @@ as ppe_ds_wlan_ops.
  				    unsigned int count, unsigned int size)
  {
  	struct ath12k_ds *ds = priv;
-@@ -556,18 +562,293 @@
+@@ -556,18 +562,295 @@
  	return READ_ONCE(ds->hw1_pending);
  }
  
@@ -116,13 +116,15 @@ as ppe_ds_wlan_ops.
 +	return n;
 +}
 +
++/* The TX buffers of the Direct Switch path are recycled from the WMAC
++ * completion ring (HAL_WBM2SW_RELEASE ring 6) inside
++ * ath12k_wifi7_ds_service().  nss-ppe's own txcmpl notification reports the
++ * PPE2TCL descriptors it retired, which is a different resource: handing those
++ * cookies to ath12k_ds_release() would treat them as RX descriptors, fail the
++ * magic check and fault the whole instance.
++ */
 +static void ath12k_ds_release_tx_desc_single(int node, u32 cookie)
 +{
-+	struct ath12k_ds *ds = ath12k_ds_by_node(node);
-+	u64 full = cookie;
-+
-+	if (ds)
-+		ath12k_ds_release(ds, &full, 1);
 +}
 +
 +static void ath12k_ds_set_tcl_prod_idx(int node, u16 index)
@@ -409,10 +411,12 @@ as ppe_ds_wlan_ops.
  					if (ath12k_ds_tcl_cons(ds) ==
  					    ath12k_ds_srng(ds, &ds->tcl)->u.src_ring.hp /
  					    ath12k_ds_srng(ds, &ds->tcl)->entry_size) {
-@@ -1362,7 +1582,7 @@
+@@ -1362,9 +1582,9 @@
  					continue;
- 				ath12k_hif_write32(dp->ab, ATH12K_DS_VP_TABLE + i * 4, 0);
- 				ath12k_hif_read32(dp->ab, ATH12K_DS_VP_TABLE + i * 4);
+ 				ath12k_hif_write32(dp->ab, ATH12K_DS_VP_TABLE +
+ 						  (u32)vp->port * 4, 0);
+ 				ath12k_hif_read32(dp->ab, ATH12K_DS_VP_TABLE +
+ 						 (u32)vp->port * 4);
 -				ret = qcom_ppe_ds_vp_free(ds->handle, vp->port);
 +				ret = ath12k_ds_nss_vp_free(ds, vp->port);
  				if (ret) {
