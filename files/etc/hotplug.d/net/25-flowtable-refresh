@@ -1,0 +1,43 @@
+#!/bin/sh
+#
+# fw4 resolves the flowtable device list when it starts.  At that moment the
+# wireless netdevs do not exist yet, so a bridge like br-lan is expanded to its
+# wired ports only and no flow touching a wlan interface can ever reach the
+# fast path - packets crossing between Ethernet and Wi-Fi are then handled by
+# the slow bridge/netfilter path on a single CPU.
+#
+# Wireless netdevs appear - and disappear again on a wifi reload - long after
+# fw4 has run, so refresh the firewall when they show up or go away.  A burst
+# of events arrives (one per vif), so only the last one in the burst performs
+# the reload.
+
+case "$ACTION" in
+add|remove) ;;
+*) exit 0 ;;
+esac
+
+case "$DEVNAME" in
+wlan*) ;;
+*) exit 0 ;;
+esac
+
+# Only useful when flow offloading is enabled at all.
+[ "$(uci -q get firewall.@defaults[0].flow_offloading)" = "1" ] || exit 0
+
+STAMP=/tmp/.flowtable-refresh
+MARK="$$-$(date +%s 2>/dev/null || echo 0)"
+
+# Claim this burst; a later event overwrites the marker and takes over.
+echo "$MARK" > "$STAMP"
+
+(
+	# Wait for the rest of the burst to arrive.
+	sleep 3
+
+	[ "$(cat "$STAMP" 2>/dev/null)" = "$MARK" ] || exit 0
+
+	rm -f "$STAMP"
+	/sbin/fw4 reload
+) </dev/null >/dev/null 2>&1 &
+
+exit 0
