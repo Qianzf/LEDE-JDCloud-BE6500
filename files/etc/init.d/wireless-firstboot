@@ -1,33 +1,42 @@
 #!/bin/sh /etc/rc.common
-# Generate the factory wireless configuration once, on a system that has none.
+# Make sure the wireless configuration lists every radio this board has.
 #
-# uci-defaults cannot do this: they run before ath12k has probed its radios
-# (about 10-15 s into boot), so "wifi config" would only create an empty file
-# and the radios would never appear in it.  The ieee80211 hotplug handler has
-# the opposite problem: it depends on a uevent that is not reliably delivered
-# this early in boot.  Wait for the first wiphy here and generate the config
-# from the radios that actually exist.  An existing /etc/config/wireless is
-# never touched, so user settings survive sysupgrade.
+# Nothing else does this on a JDCloud RE-CS-06.  The image ships no
+# /etc/config/wireless, and the uci-defaults that used to generate it
+# (95-gl-wireless-country) exits immediately unless the board is a
+# gl.inet,gl-be9300, so on this board "wifi config" was never executed at all.
+# The remaining path, the ieee80211 hotplug handler, never fired in practice.
+#
+# "wifi config" is idempotent: it starts numbering at the first free radioN and
+# only adds sections for phys that are not configured yet, so existing radios
+# keep their SSID, key, channel and every other user setting.  Running it on
+# every boot is therefore safe and also repairs a config that was generated
+# while only some of the phys were registered.
+#
+# ath12k probes its radios roughly 10-15 s into boot, well after rcS reaches
+# this script, so wait for a wiphy before asking for the configuration.
 
 START=99
 STOP=01
 
 boot() {
-	[ -s /etc/config/wireless ] && return 0
+	[ -x /sbin/wifi ] || return 0
 
+	# Wait for the first wiphy; without it "wifi config" would create an empty
+	# /etc/config/wireless and report nothing.
 	local i=0
 	while [ $i -lt 40 ]; do
 		[ -n "$(ls /sys/class/ieee80211 2>/dev/null)" ] && break
 		sleep 1
 		i=$((i + 1))
 	done
+	[ $i -lt 40 ] || return 0
 
 	/sbin/wifi config >/dev/null 2>&1
 	[ -s /etc/config/wireless ] || return 0
 
 	ubus call network reload >/dev/null 2>&1
 	/sbin/wifi up >/dev/null 2>&1
-	logger -t wireless-firstboot "generated the factory wireless config"
 }
 
 start() { boot; }
